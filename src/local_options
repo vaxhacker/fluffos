@@ -20,7 +20,7 @@
 /****************************************************************************
  *                              COMPAT                                      *
  ****************************************************************************/
-#undef NO_ADD_ACTION
+#define NO_ADD_ACTION
 #undef NO_SNOOP
 #undef NO_ENVIRONMENT
 #undef NO_WIZARDS

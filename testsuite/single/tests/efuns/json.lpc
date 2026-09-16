@@ -1,0 +1,191 @@
+// Explicit efun:: calls exercise the driver even when a mudlib supplies
+// simulated efuns with these names (the testsuite keeps its LPC JSON library).
+class JsonUnsupported { int value; }
+
+void primitives() {
+  mixed missing = ([])["missing"];
+  mixed value;
+#if !efun_defined(json_encode) || !efun_defined(json_decode)
+#error JSON must be available as core efuns.
+#endif
+  ASSERT_EQ("0", efun::json_encode(0));
+  ASSERT_EQ("1", efun::json_encode(1));
+  ASSERT_EQ("null", efun::json_encode(missing));
+  ASSERT(undefinedp(efun::json_decode("null")));
+  ASSERT(!undefinedp(efun::json_decode("0")));
+  ASSERT(!undefinedp(efun::json_decode("false")));
+  ASSERT_EQ(1, efun::json_decode("true"));
+  ASSERT_EQ(0, efun::json_decode("false"));
+  ASSERT_EQ(42, efun::json_decode(" \t\r\n42 \r\n"));
+  ASSERT_EQ(9223372036854775807, efun::json_decode("9223372036854775807"));
+  ASSERT_EQ(-9223372036854775807 - 1, efun::json_decode("-9223372036854775808"));
+  ASSERT_EQ("9223372036854775807", efun::json_encode(9223372036854775807));
+  ASSERT_EQ("-9223372036854775808", efun::json_encode(-9223372036854775807 - 1));
+  foreach (float number in ({ 0.0, -0.0, 1.0, 1.2345678901234567,
+    0.000000000123456789, to_float("1e200"), to_float("5e-324") })) {
+    value = efun::json_decode(efun::json_encode(number));
+    ASSERT(floatp(value));
+    ASSERT_EQ(number, value);
+  }
+  ASSERT_EQ(1250.0, efun::json_decode("1.25e+3"));
+  ASSERT_EQ(0.0125, efun::json_decode("1.25E-2"));
+  ASSERT_EQ(0.0, efun::json_decode("0.0e-9999"));
+  ASSERT_EQ("[]", efun::json_encode(({})));
+  ASSERT_EQ("{}", efun::json_encode(([])));
+  ASSERT_EQ(({}), efun::json_decode("[]"));
+  ASSERT_EQ(([]), efun::json_decode("{}"));
+}
+
+void strings_and_buffers() {
+  string text = "A room: 世界 😄 é\n\t\r\b\x0c\"\\/\e[31m";
+  string encoded = efun::json_encode(text);
+  ASSERT_EQ(text, efun::json_decode(encoded));
+  ASSERT_EQ(text, efun::json_decode(to_buffer(encoded)));
+  ASSERT_EQ("", efun::json_decode("\"\""));
+  ASSERT_EQ("\"\"", efun::json_encode(""));
+  ASSERT_EQ("😄", efun::json_decode("\"\\ud83d\\ude04\""));
+  ASSERT_EQ("a/b", efun::json_decode("\"a\\/b\""));
+  ASSERT_EQ("{\"\":1,\"a\\n\":2,\"世界\":3}",
+    efun::json_encode(([ "": 1, "a\n": 2, "世界": 3 ])));
+  ASSERT_EQ(([ "": 1, "a\n": 2, "世界": 3 ]),
+    efun::json_decode("{\"\":1,\"a\\n\":2,\"世界\":3}"));
+  ASSERT_EQ(7, efun::json_decode(to_buffer("7")));
+  ASSERT(catch(efun::json_decode(to_buffer(({ 34, 255, 34 })))));
+  ASSERT(catch(efun::json_decode(to_buffer(({ 49, 0, 50 })))));
+  ASSERT(catch(efun::json_decode(to_buffer(({ 49, 0 })))));
+  ASSERT(catch(efun::json_decode(allocate_buffer(0))));
+}
+
+void saved_records() {
+  // A blueprint/delta/inventory tree, including an explicitly false flag,
+  // absent optional fields, Unicode prose, and precise fractional metadata.
+  mapping original = ([
+    "v": 1, "p": "/obj/chest", "#short#": "a weathered chest",
+    "d": ([ "closed": 0, "locked": 1, "props": ([ "owner": "小明", "scale": 1.234567890123 ]) ]),
+    "inv": ({ ([ "p": "/obj/torch", "d": ([ "fuel": 42 ]) ]),
+      ([ "p": "/obj/sword", "slot": "wield", "pos": 0 ]) })
+  ]);
+  mapping restored = efun::json_decode(efun::json_encode(original));
+  mixed *shared = ({ "shared", ([ "n": 2 ]) });
+  mapping nulls = efun::json_decode("{\"zero\":0,\"nothing\":null}");
+  ASSERT_EQ(original, restored);
+  ASSERT(!undefinedp(restored["d"]["closed"]));
+  ASSERT_EQ(0, restored["d"]["closed"]);
+  ASSERT(undefinedp(restored["slot"]));
+  ASSERT_EQ("{\"nothing\":null,\"zero\":0}", efun::json_encode(nulls));
+  ASSERT_EQ(2, sizeof(nulls));
+  // Repeated references without a cycle are legal; JSON copies their values.
+  ASSERT_EQ(({ shared, shared }), efun::json_decode(efun::json_encode(({ shared, shared }))));
+  ASSERT_EQ("{\"a\":1,\"z\":2}", efun::json_encode(([ "z": 2, "a": 1 ])));
+  ASSERT_EQ(([ "key": ({ 3, 4 }) ]),
+    efun::json_decode("{\"key\":{\"old\":[1,2]},\"key\":[3,4]}"));
+}
+
+void invalid_values() {
+  mixed bad_argument = 123;
+  mixed *cycle = allocate(1);
+  mapping loop = ([]);
+  mixed err;
+  ASSERT(catch(efun::json_decode(bad_argument)));
+  foreach (mixed bad in ({
+    this_object(),
+    (: 1 :),
+    allocate_buffer(0),
+    new(class JsonUnsupported),
+    promise_create()
+  })) {
+    ASSERT(catch(efun::json_encode(bad)));
+    ASSERT(catch(efun::json_encode(({ "prefix", bad }))));
+  }
+  ASSERT(catch(efun::json_encode(([ 1: "one", "safe": 2 ]))));
+  ASSERT(catch(efun::json_encode(([ "nested": ([ 0: 1 ]) ]))));
+  ASSERT(catch(efun::json_encode(to_float("nan"))));
+  ASSERT(catch(efun::json_encode(to_float("inf"))));
+  ASSERT(catch(efun::json_encode(to_float("-inf"))));
+  cycle[0] = cycle;
+  err = catch(efun::json_encode(cycle));
+  cycle[0] = 0;  // unconditional teardown, before asserting
+  ASSERT(err);
+  loop["cycle"] = ({ loop });
+  err = catch(efun::json_encode(loop));
+  map_delete(loop, "cycle");
+  ASSERT(err);
+  ASSERT_EQ("[1,2]", efun::json_encode(({ 1, 2 })));
+}
+
+void invalid_input() {
+  string *invalid = ({ "", " ", "1e", "1.", "1e+", "01", "+1", "-.5",
+    "[1,]", "{\"a\":1,}", "{1:2}", "[", "{", "true false",
+    "//comment\n1", "/*comment*/1", "NaN", "Infinity", "1e9999", "1e-9999",
+    "9223372036854775808", "-9223372036854775809", "18446744073709551616",
+    "\"literal\nnewline\"", "\"\\x41\"", "\"\\ud800\"", "\"\\udc00\"",
+    "\"\\ud800\\u0041\"", "\"\\u0000\"", "{\"a\\u0000b\":1}", "\x0c" + "1" });
+  foreach (string input in invalid) {
+    ASSERT2(catch(efun::json_decode(input)), "must reject " + sprintf("%O", input));
+  }
+  // Fail after allocating nested strings, mappings and arrays. Debug's
+  // post-file check_memory() and sanitizers verify every partial tree is freed.
+  for (int i = 0; i < 30; i++) {
+    ASSERT(catch(efun::json_decode("{\"a\":[{\"b\":\"owned\"},[1,2]],\"c\":[\"owned\",")));
+    ASSERT(catch(efun::json_decode("{\"a\":[{\"b\":\"owned\"}],\"c\":9223372036854775808}")));
+  }
+  ASSERT_EQ(([ "ok": 1 ]), efun::json_decode("{\"ok\":1}"));
+}
+
+void depth_limits() {
+  mixed nested = 0;
+  string text = "0";
+  for (int i = 0; i < 128; i++) {
+    nested = ({ nested });
+    text = "[" + text + "]";
+  }
+  ASSERT_EQ(text, efun::json_encode(nested));
+  ASSERT_EQ(text, efun::json_encode(efun::json_decode(text)));
+  ASSERT(catch(efun::json_encode(({ nested }))));
+  ASSERT(catch(efun::json_decode("[" + text + "]")));
+}
+
+void allocation_limits() {
+  // CFG_INT(11/13/14): restore each setting before calling the assertion
+  // machinery, which itself allocates arrays, mappings and diagnostic strings.
+  int old;
+  mixed err, replacement, replacement_error;
+  string long_text = implode(allocate(300, "x"), "");
+  old = get_config(267);
+  set_config(267, 4);
+  err = catch(efun::json_decode("[\"a\",{},[],\"b\",\"c\"]"));
+  set_config(267, old);
+  ASSERT(err);
+  old = get_config(269);
+  set_config(269, 2);
+  err = catch(efun::json_decode("{\"a\":[],\"b\":{},\"c\":\"owned\"}"));
+  replacement_error = catch(replacement = efun::json_decode("{\"a\":1,\"b\":2,\"a\":3}"));
+  set_config(269, old);
+  ASSERT(err);
+  ASSERT(!replacement_error);
+  ASSERT_EQ(([ "a": 3, "b": 2 ]), replacement);
+  long_text = "\"" + long_text + "\"";
+  old = get_config(270);
+  set_config(270, 256);
+  err = catch(efun::json_decode(long_text));
+  set_config(270, old);
+  ASSERT(err);
+  // The input is legal at the original limit; escaping must not allow the
+  // encoder to emit an output longer than the configured maximum.
+  long_text = implode(allocate(200, "\n"), "");
+  set_config(270, 256);
+  err = catch(efun::json_encode(long_text));
+  set_config(270, old);
+  ASSERT(err);
+  ASSERT_EQ("\"ok\"", efun::json_encode("ok"));
+}
+
+void do_tests() {
+  primitives();
+  strings_and_buffers();
+  saved_records();
+  invalid_values();
+  invalid_input();
+  depth_limits();
+  allocation_limits();
+}

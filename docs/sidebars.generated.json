@@ -2724,6 +2724,18 @@
           },
           {
             "type": "doc",
+            "id": "efun/strings/json_decode",
+            "key": "efun/strings/json_decode",
+            "label": "json_decode"
+          },
+          {
+            "type": "doc",
+            "id": "efun/strings/json_encode",
+            "key": "efun/strings/json_encode",
+            "label": "json_encode"
+          },
+          {
+            "type": "doc",
             "id": "efun/strings/lower_case",
             "key": "efun/strings/lower_case",
             "label": "lower_case"

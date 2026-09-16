@@ -54,6 +54,9 @@ string *explode(string, string);
 string *explode_reversible(string, string);
 mixed implode(mixed *, string | function, void | mixed);
 
+string json_encode(mixed);
+mixed json_decode(string | buffer);
+
 /* classic form: call_out(fn, delay, args...) -> handle. With NO callback --
    call_out(delay) -- returns a PROMISE fulfilled when the delay elapses
    (issue #1319); the delay's position moves, so both forms' later args are

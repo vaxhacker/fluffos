@@ -553,7 +553,10 @@ lws_tls_client_connect(struct lws *wsi, char *errbuf, size_t elen)
 
 		if (len >= sizeof(a))
 			len = sizeof(a) - 1;
-		memcpy(a, (const char *)prot, len);
+		/* No ALPN selection is valid (eg, an HTTP/1.1-only peer).
+		 * OpenSSL returns NULL, 0 then; memcpy(NULL, 0) is still UB. */
+		if (len)
+			memcpy(a, (const char *)prot, len);
 		a[len] = '\0';
 
 		lws_role_call_alpn_negotiated(wsi, (const char *)a);

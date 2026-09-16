@@ -35,7 +35,11 @@
 #define RELEASE_LATCH(name) "/single/master"->release_latch(name)
 
 #define SAVETP tp = this_player()
+#ifdef __NO_ADD_ACTION__
+#define RESTORETP set_this_player(tp)
+#else
 #define RESTORETP { if (tp) evaluate(bind( (: enable_commands :), tp)); else { object youd_never_use_this_as_a_var = new("/single/void"); evaluate(bind( (: enable_commands :), youd_never_use_this_as_a_var)); destruct(youd_never_use_this_as_a_var); } }
+#endif
 
 #ifdef __OLD_TYPE_BEHAVIOR__
 #define TYPETEST scream and die

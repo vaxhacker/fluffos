@@ -1,8 +1,10 @@
 void do_tests() {
+#ifndef __NO_ADD_ACTION__
   // The notify_fail message lives on the INTERACTIVE command giver;
   // with no interactive (autotest) the query returns 0 and setting
   // one is a harmless no-op.
   ASSERT_EQ(0, query_notify_fail());
   ASSERT_EQ(0, catch(notify_fail("nope\n")));
   ASSERT_EQ(0, query_notify_fail());
+#endif
 }

@@ -57,6 +57,27 @@ The native implementation is stricter than the testsuite's LPC helper:
 it rejects unsupported values, non-string keys and cycles, and does not
 round floats to six decimal places.
 
+### MUDLIB INTEGRATION
+
+The codec requires no schema file. A mudlib's existing object-to-mapping
+conversion layer can supply the value, provided every nested value satisfies
+the table above. Keep blueprint identifiers, record versions and saved fields
+in that layer. Decoding the JSON does not clone an object, apply its properties,
+write a save file or migrate an existing save format.
+
+Use the preprocessor to require a driver with this efun:
+
+```c
+#if !efun_defined(json_encode)
+#error This mudlib requires native JSON efuns
+#endif
+```
+
+Availability depends on the running executable. Rebuild and restart the driver
+to add an efun; reloading LPC alone cannot add it. Native launchers, containers
+and CI can use separate executables, so update each build's pinned source or
+installed binary. The `NO_ADD_ACTION` compile-time option is unrelated to JSON.
+
 ### SEE ALSO
 
 [json_decode](json_decode), [save_variable](../general/save_variable),

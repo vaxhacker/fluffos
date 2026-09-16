@@ -60,6 +60,12 @@ struct FlagEntry {
 };
 
 const FlagEntry INT_FLAGS[] = {
+    {"http default timeout", __HTTP_DEFAULT_TIMEOUT__, 15000, 1, INT_MAX, "HTTP Client",
+     "Default http_request() deadline in milliseconds, including DNS and redirects."},
+    {"http max body", __HTTP_MAX_BODY__, 400000, 0, INT_MAX, "HTTP Client",
+     "Maximum HTTP response body in bytes. Requests may lower this ceiling with max_body; the "
+     "maximum buffer size (or maximum string length for text) also applies. Overflow rejects "
+     "with too_large rather than truncating."},
     {"time to clean up", __TIME_TO_CLEAN_UP__, 600, 0, INT_MAX, "Timing & Lifecycle",
      "Seconds an object may be idle before clean_up() is called on it; should be well above 'time "
      "to swap'."},
@@ -235,6 +241,10 @@ struct StrFlagEntry {
 };
 
 const StrFlagEntry STR_FLAGS[] = {
+    {"http allowed hosts", __HTTP_ALLOWED_HOSTS__, kOptional, "config file: hah", "HTTP Client",
+     "Whitespace- or comma-separated list of exact host:port authorities permitted by "
+     "http_request(), for example 127.0.0.1:5984 or db.example:443. Use brackets for IPv6. "
+     "Empty denies all requests. Every request and redirect also requires valid_http approval."},
     {"name", __MUD_NAME__, kMustHave, "config file: mn", "Identity & Network", "Name of this MUD."},
     {"mudlib directory", __MUD_LIB_DIR__, kMustHave, "config file: mld", "Directory Structure",
      "Absolute path to the mudlib root (this path is not relative to the mudlib)."},

@@ -1376,6 +1376,25 @@
       },
       {
         "type": "category",
+        "key": "efun/http",
+        "label": "HTTP Client",
+        "link": {
+          "type": "generated-index",
+          "title": "HTTP Client",
+          "slug": "/efun/http/",
+          "description": "Asynchronous HTTP and HTTPS requests with native promises."
+        },
+        "items": [
+          {
+            "type": "doc",
+            "id": "efun/http/http_request",
+            "key": "efun/http/http_request",
+            "label": "http_request"
+          }
+        ]
+      },
+      {
+        "type": "category",
         "key": "efun/interactive",
         "label": "Interactive & Networking",
         "link": {
@@ -3343,6 +3362,12 @@
             "id": "apply/master/valid_hide",
             "key": "apply/master/valid_hide",
             "label": "valid_hide"
+          },
+          {
+            "type": "doc",
+            "id": "apply/master/valid_http",
+            "key": "apply/master/valid_http",
+            "label": "valid_http"
           },
           {
             "type": "doc",

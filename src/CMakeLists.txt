@@ -30,6 +30,7 @@ option(PACKAGE_TRIM "trim package" ON)
 option(PACKAGE_UIDS "uids package" ON)
 option(PACKAGE_EXTERNAL "external package" ON)
 option(PACKAGE_FFI "foreign function interface package (libffi)" ON)
+option(PACKAGE_HTTP "asynchronous HTTP client package (libwebsockets)" ON)
 # The JS bridge only exists on the Emscripten/WASM target (LPC <-> page
 # JavaScript); default it off everywhere else.
 if (EMSCRIPTEN)
@@ -54,6 +55,7 @@ if (EMSCRIPTEN)
   set(PACKAGE_DB OFF)        # MySQL/SQLite/Postgres clients
   set(PACKAGE_EXTERNAL OFF)  # posix_spawn + socketpair
   set(PACKAGE_FFI OFF)       # libffi/dlopen
+  set(PACKAGE_HTTP OFF)      # libwebsockets / native network
   set(PACKAGE_SOCKETS OFF)   # BSD sockets
   # pcre stays ON: build-deps.sh cross-builds a static libpcre into the
   # wasm-deps prefix, which CMAKE_FIND_ROOT_PATH below lets FindPCRE see.

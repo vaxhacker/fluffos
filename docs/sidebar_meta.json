@@ -59,6 +59,10 @@
     "label": "General",
     "description": "Miscellaneous efuns: vector and matrix math, compression, type predicates, save/restore and generic collection helpers."
   },
+  "efun/http": {
+    "label": "HTTP Client",
+    "description": "Asynchronous HTTP and HTTPS requests with native promises."
+  },
   "efun/interactive": {
     "label": "Interactive & Networking",
     "description": "Player connections, input/output, snooping, telnet negotiation and terminal protocols (GMCP, MSDP, MXP, MSP, ZMP)."

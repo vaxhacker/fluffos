@@ -394,3 +394,8 @@ compiler stack size : 200
 # also implicitly readable.
 allowed os environment variables : PATH:FLUFFOS_TEST_RO
 writable os environment variables : FLUFFOS_TEST_RW
+
+# Outbound HTTP is denied in the ordinary, network-free LPC suite.
+http allowed hosts :
+http default timeout : 15000
+http max body : 400000

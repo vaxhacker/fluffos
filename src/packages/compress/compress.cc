@@ -18,13 +18,13 @@ void f_compress_file() {
   int readb;
   int len;
   int const num_arg = st_num_arg;
-  const char *input_file;
-  const char *output_file;
-  const char *real_input_file;
-  const char *real_output_file;
-  char *tmpout;
+  const char* input_file;
+  const char* output_file;
+  const char* real_input_file;
+  const char* real_output_file;
+  char* tmpout;
   gzFile out_file;
-  FILE *in_file;
+  FILE* in_file;
   char buf[4096];
   char outname[1024];
 
@@ -59,7 +59,17 @@ void f_compress_file() {
 
   real_output_file = check_valid_path(output_file, current_object, "compress_file", 1);
   if (!real_output_file) {
-    FREE_MSTR(output_file);
+    if (num_arg != 2) {
+      FREE_MSTR(output_file);
+    }
+    pop_n_elems(num_arg);
+    push_number(0);
+    return;
+  }
+  if (strlen(real_output_file) >= sizeof(outname)) {
+    if (num_arg != 2) {
+      FREE_MSTR(output_file);
+    }
     pop_n_elems(num_arg);
     push_number(0);
     return;
@@ -113,11 +123,11 @@ void f_uncompress_file() {
   int readb;
   int len;
   int const num_arg = st_num_arg;
-  const char *input_file;
-  const char *output_file;
-  const char *real_input_file;
-  const char *real_output_file;
-  FILE *out_file;
+  const char* input_file;
+  const char* output_file;
+  const char* real_input_file;
+  const char* real_output_file;
+  FILE* out_file;
   gzFile in_file;
   char buf[4196];
   char outname[1024];
@@ -138,7 +148,7 @@ void f_uncompress_file() {
     }
     output_file = (sp - num_arg + 2)->u.string;
   } else {
-    char *tmp;
+    char* tmp;
     len = strlen(input_file);
     if (strcmp(input_file + len - strlen(GZ_EXTENSION), GZ_EXTENSION) != 0) {
       // Not compressed...
@@ -158,6 +168,14 @@ void f_uncompress_file() {
       FREE_MSTR(output_file);
     }
 
+    pop_n_elems(num_arg);
+    push_number(0);
+    return;
+  }
+  if (strlen(real_output_file) >= sizeof(outname)) {
+    if (num_arg != 2) {
+      FREE_MSTR(output_file);
+    }
     pop_n_elems(num_arg);
     push_number(0);
     return;
@@ -207,15 +225,15 @@ void f_uncompress_file() {
 
 #ifdef F_COMPRESS
 void f_compress() {
-  unsigned char *buffer;
-  unsigned char *input;
+  unsigned char* buffer;
+  unsigned char* input;
   int size;
-  buffer_t *real_buffer;
+  buffer_t* real_buffer;
   uLongf new_size;
 
   if (sp->type == T_STRING) {
     size = SVALUE_STRLEN(sp);
-    input = (unsigned char *)sp->u.string;
+    input = (unsigned char*)sp->u.string;
   } else if (sp->type == T_BUFFER) {
     size = sp->u.buf->size;
     input = sp->u.buf->item;
@@ -227,32 +245,32 @@ void f_compress() {
 
   new_size = compressBound(size);
   // Make it a little larger as specified in the docs.
-  buffer = reinterpret_cast<unsigned char *>(DMALLOC(new_size, TAG_TEMPORARY, "compress"));
+  buffer = reinterpret_cast<unsigned char*>(DMALLOC(new_size, TAG_TEMPORARY, "compress"));
   compress(buffer, &new_size, input, size);
 
   // Shrink it down.
   pop_n_elems(st_num_arg);
   real_buffer = allocate_buffer(new_size);
-  write_buffer(real_buffer, 0, reinterpret_cast<char *>(buffer), new_size);
+  write_buffer(real_buffer, 0, reinterpret_cast<char*>(buffer), new_size);
   FREE(buffer);
   push_refed_buffer(real_buffer);
 }
 #endif
 
 #ifdef F_UNCOMPRESS
-static void *zlib_alloc(void * /*opaque*/, unsigned int items, unsigned int size) {
+static void* zlib_alloc(void* /*opaque*/, unsigned int items, unsigned int size) {
   return DCALLOC(items, size, TAG_TEMPORARY, "zlib_alloc");
 }
 
-static void zlib_free(void * /*opaque*/, void *address) { FREE(address); }
+static void zlib_free(void* /*opaque*/, void* address) { FREE(address); }
 
 void f_uncompress() {
-  z_stream *compressed;
+  z_stream* compressed;
   unsigned char compress_buf[COMPRESS_BUF_SIZE];
-  unsigned char *output_data = nullptr;
+  unsigned char* output_data = nullptr;
   int len;
   int pos;
-  buffer_t *buffer;
+  buffer_t* buffer;
   int ret;
 
   if (sp->type == T_BUFFER) {
@@ -264,7 +282,7 @@ void f_uncompress() {
   }
 
   compressed =
-      reinterpret_cast<z_stream *>(DMALLOC(sizeof(z_stream), TAG_INTERACTIVE, "start_compression"));
+      reinterpret_cast<z_stream*>(DMALLOC(sizeof(z_stream), TAG_INTERACTIVE, "start_compression"));
   compressed->next_in = buffer->item;
   compressed->avail_in = buffer->size;
   compressed->next_out = compress_buf;
@@ -281,15 +299,23 @@ void f_uncompress() {
 
   len = 0;
   output_data = nullptr;
+  bool too_large = false;
   do {
     ret = inflate(compressed, 0);
     if (ret == Z_OK || ret == Z_STREAM_END) {
       pos = len;
       len += COMPRESS_BUF_SIZE - compressed->avail_out;
+      if (len > CONFIG_INT(__MAX_BUFFER_SIZE__)) {
+        // Decompressed output has grown past the configured limit (e.g. a
+        // zip bomb) -- stop here, before `len` can overflow the plain int
+        // used for the DMALLOC/DREALLOC/memcpy sizes below.
+        too_large = true;
+        break;
+      }
       if (!output_data) {
-        output_data = reinterpret_cast<unsigned char *>(DMALLOC(len, TAG_TEMPORARY, "uncompress"));
+        output_data = reinterpret_cast<unsigned char*>(DMALLOC(len, TAG_TEMPORARY, "uncompress"));
       } else {
-        output_data = reinterpret_cast<unsigned char *>(
+        output_data = reinterpret_cast<unsigned char*>(
             DREALLOC(output_data, len, TAG_TEMPORARY, "uncompress"));
       }
       memcpy(output_data + pos, compress_buf, len - pos);
@@ -302,13 +328,24 @@ void f_uncompress() {
 
   pop_n_elems(st_num_arg);
 
+  if (too_large) {
+    if (output_data) {
+      FREE(output_data);
+    }
+    FREE(compressed);
+    error("uncompress: decompressed data exceeds maximum buffer size\n");
+  }
+
   if (ret == Z_STREAM_END) {
     buffer = allocate_buffer(len);
-    write_buffer(buffer, 0, reinterpret_cast<char *>(output_data), len);
+    write_buffer(buffer, 0, reinterpret_cast<char*>(output_data), len);
     FREE(output_data);
     push_refed_buffer(buffer);
     FREE(compressed);
   } else {
+    if (output_data) {
+      FREE(output_data);
+    }
     FREE(compressed);
     error("inflate: no ZSTREAM_END\n");
   }

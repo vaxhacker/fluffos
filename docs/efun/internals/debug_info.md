@@ -1,5 +1,4 @@
 ---
-layout: doc
 title: internals / debug_info
 ---
 # debug_info
@@ -67,5 +66,5 @@ title: internals / debug_info
 
 ### SEE ALSO
 
-    dump_file_descriptors(3), dump_socket_status(3)
+    dump_file_descriptors(3)
 

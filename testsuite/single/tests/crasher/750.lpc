@@ -1,0 +1,30 @@
+string *query_temp(string);
+string query(string);
+
+varargs string name(int raw) {
+  string str, *mask;
+
+  if (!raw && sizeof(mask = query_temp("apply/name")))  //这行报错
+    return mask[sizeof(mask) - 1];
+  else {
+    if (stringp(str = query("name")))
+      return str;
+    else
+      return file_name(this_object());
+  }
+}
+
+string object_name() {
+  return name();
+}
+
+void do_tests() {
+  // Issue #750: name()/object_name() erroring must not crash the driver,
+  // even though the driver's own error/trace printer needs to represent
+  // this same object via %O while it unwinds. this_object() alone is
+  // enough to hit that path -- looping sprintf("%O") over every objects()
+  // in the game (the original report's exact code) only adds output
+  // proportional to however many objects happen to be loaded elsewhere in
+  // a full suite run, without exercising anything extra.
+  write(sprintf("%O: %d\n", this_object(), refs(this_object())));
+}

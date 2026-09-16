@@ -12,10 +12,8 @@ Applies are callback functions that the driver calls on LPC objects in response 
 
 **Directory Structure:**
 ```
-/docs/apply/
-  ├── index.md                    # Apply overview
+/docs/apply/                     # (no index.md files — sidebar + generated-index pages)
   ├── interactive/                # Player/connection-related applies
-  │   ├── index.md               # List of interactive applies
   │   ├── logon.md               # Called when player connects
   │   ├── net_dead.md            # Called when connection drops
   │   ├── process_input.md       # Input preprocessing
@@ -23,14 +21,12 @@ Applies are callback functions that the driver calls on LPC objects in response 
   │   ├── gmcp.md, mxp_tag.md    # Protocol-specific applies
   │   └── ...
   ├── master/                     # Master object applies
-  │   ├── index.md               # List of master applies
   │   ├── connect.md             # New connection handling
   │   ├── crash.md               # Crash/error handling
   │   ├── compile_object.md      # Compilation control
   │   ├── valid_*.md             # Security validation applies
   │   └── ...
   └── object/                     # Standard object applies
-      ├── index.md               # List of object applies
       ├── create.md              # Object creation
       ├── init.md                # Object initialization
       ├── reset.md               # Object reset
@@ -40,7 +36,6 @@ Applies are callback functions that the driver calls on LPC objects in response 
 **Apply Documentation Template:**
 ```markdown
 ---
-layout: doc
 title: category / apply_name
 ---
 # apply_name
@@ -85,8 +80,7 @@ Efuns (external functions) are built-in C/C++ functions callable from LPC code.
 
 **Directory Structure:**
 ```
-/docs/efun/
-  ├── index.md                    # Master list of all efuns by category
+/docs/efun/                      # (no index.md files — sidebar + generated-index pages)
   ├── arrays/                     # Array manipulation
   ├── async/                      # Asynchronous operations
   ├── buffers/                    # Buffer operations
@@ -116,7 +110,6 @@ Efuns (external functions) are built-in C/C++ functions callable from LPC code.
 **Efun Documentation Template:**
 ```markdown
 ---
-layout: doc
 title: category / efun_name
 ---
 # efun_name
@@ -183,7 +176,6 @@ Command-line tools included with FluffOS.
 **CLI Documentation Template:**
 ```markdown
 ---
-layout: doc
 title: cli / tool_name
 ---
 # cli / tool_name
@@ -216,22 +208,52 @@ Brief description.
 Documentation about driver internals, architecture, and configuration.
 
 **Topics:**
-- `config.md` - Configuration file format and options
+- `config.md` - Configuration file format and options (**auto-generated**, see below)
 - `adding_efuns.md` - How to add new efuns
 - `stackmachine.md` - VM architecture
 - `parse_tree.md` - Compiler internals
 - `call_into_vm.md` - VM integration
 - `malloc.md` - Memory management
 
+**`config.md` is generated -- do not edit it by hand.** Runtime config options
+are the `INT_FLAGS[]` and `STR_FLAGS[]` tables in
+`src/base/internal/rc.cc`, which are the source of truth for both the parser and
+the docs. `docs/gen_config_docs.py` renders `config.md` from those tables
+(their `category`/`description` fields are the prose).
+
+**Finding/Updating Config Options in Source:**
+```bash
+# The recognized options and their docs (source of truth):
+#   src/base/internal/rc.cc  ->  INT_FLAGS[] (int), STR_FLAGS[] (string)
+# A few irregular ones (ports, external_cmd, global include file, default fail
+# message) are hand-documented in the SPECIAL_OPTIONS block of the generator.
+
+# Regenerate the doc after any rc.cc table change:
+python3 docs/gen_config_docs.py
+
+# Verify the committed doc is up to date (this is what CI runs):
+python3 docs/gen_config_docs.py --check
+```
+Never add an option to `config.md` that is not in `rc.cc` -- edit the table and
+regenerate instead. CI (`.github/workflows/config-docs.yml`) fails if the doc is
+stale.
+
 ### 5. Build Documentation (`/docs/`)
 
 Root-level documentation about building and deploying FluffOS.
 
 **Key Files:**
-- `build.md` - Comprehensive build guide for all platforms
-- `build_v2017.md` - Legacy build instructions
-- `index.md` - Main documentation landing page
-- `bug.md` - Bug reporting guidelines
+- `start.md` - Human onboarding: pick a mudlib, build, boot that lib
+- `lpc/dev-environment.md` - Editor plugin, docs-site LPC highlighter, formatter
+- `llm.md` - LLM contract (`/llm`): **ask which mudlib** before cloning; do not default to `testsuite/`
+- `mudlib-agents.md` - Template `AGENTS.md` to copy into the chosen mudlib
+- `ecosystem.md` - Map of every public `fluffos/*` repository
+- `build.mdx` - Comprehensive build guide for all platforms (MDX, per-platform tabs)
+- `index.mdx` - Main documentation landing page (MDX, card grid)
+- `bug.md` - Troubleshooting and bug reporting
+- `license.md` - License (full text; do not dump it on the homepage)
+- `static/llms.txt` - Machine-readable site map at `/llms.txt`
+- Legacy v2017 build notes live in `archive/` (not published)
 
 ### 6. Concepts Documentation (`/docs/concepts/`)
 
@@ -296,7 +318,7 @@ ls docs/cli/*.md
 2. Find implementation by searching for `APPLY_NAME`
 3. Determine category: interactive, master, or object
 4. Create markdown file: `docs/apply/category/name.md`
-5. Update index: `docs/apply/category/index.md`
+5. Regenerate the sidebar: `python3 docs/gen_sidebar.py`
 6. Use the apply documentation template
 
 **For a New Efun:**
@@ -304,9 +326,8 @@ ls docs/cli/*.md
 2. Find implementation: `src/packages/*/*.cc`
 3. Determine appropriate category (see mapping above)
 4. Create markdown file: `docs/efun/category/name.md`
-5. Update index: `docs/efun/index.md` (add to category list)
-6. Update category index: `docs/efun/category/index.md`
-7. Use the efun documentation template
+5. Regenerate the sidebar: `python3 docs/gen_sidebar.py`
+6. Use the efun documentation template
 
 **For a New CLI Tool:**
 1. Find source: `src/main_*.cc`
@@ -348,7 +369,6 @@ done
 **Front Matter:**
 ```yaml
 ---
-layout: doc
 title: category / name
 ---
 ```
@@ -394,8 +414,8 @@ title: category / name
 - Compile-time optional features
 
 **Detection:**
-- Compare `/src/vm/internal/applies` with `docs/apply/*/index.md`
-- Compare package specs with `docs/efun/*/index.md`
+- Compare `/src/vm/internal/applies` with the files in `docs/apply/*/`
+- Compare package specs with the files in `docs/efun/*/`
 - Check `src/CMakeLists.txt` executables vs `docs/cli/`
 
 ### 3. Incorrect Examples
@@ -424,7 +444,7 @@ title: category / name
 cd docs
 npm install
 npm run dev
-# Visit http://localhost:5173
+# Visit http://localhost:3000
 ```
 
 **Check for Broken Links:**
@@ -435,14 +455,10 @@ grep -r "\[.*\](.*\.md)" docs/ --include="*.md"
 # Verify referenced files exist
 ```
 
-**Verify Index Files:**
+**Verify the generated sidebar is fresh:**
 ```bash
-# Check apply indices match files
-for idx in docs/apply/*/index.md; do
-  dir=$(dirname $idx)
-  echo "Checking $dir"
-  # Compare index entries with actual files
-done
+# CI runs this too (.github/workflows/docs-sidebar.yml)
+python3 docs/gen_sidebar.py --check
 ```
 
 ## Package-Specific Notes
@@ -470,13 +486,60 @@ done
 - **Pattern:** Usually `protocol_enable()` and `protocol()` or `protocol_tag()`
 - **Enable flags:** Document corresponding config options
 
-## VitePress Configuration
+## Docusaurus Configuration
 
-The documentation is built using VitePress. Key files:
+> **Full technical reference**: See **[Section 9 of AGENTS.md](../AGENTS.md#9-documentation-docs)** for the authoritative build/framework guide.
 
-- `docs/.vitepress/config.mts` - VitePress configuration
-- `docs/package.json` - Dependencies and build scripts
-- Navigation is auto-generated from directory structure
+The documentation is built using **Docusaurus 3** (`@docusaurus/preset-classic`). Key files:
+
+- `docs/docusaurus.config.ts` — site config, navbar, footer, docs plugin, mermaid, redirects, sitemap, image zoom, LPC Prism highlighter, `future.faster`
+- `docs/sidebars.ts` — sidebar navigation tree (Docusaurus `SidebarsConfig` format)
+- `docs/src/css/custom.css` — Infima CSS variable overrides
+- `docs/package.json` — npm scripts: `dev`, `build`, `preview`, `clear`
+
+**Local Preview:**
+```bash
+cd docs
+npm install
+npm run dev
+# Visit http://localhost:3000
+```
+
+> **Note**: Leftovers from previous frameworks (VitePress `.vitepress/`, Jekyll `_layouts/` and `css/`) have been removed — everything is Docusaurus now.
+
+### Sidebar Format
+
+The sidebar fully expands to every page and has two layers:
+
+- `sidebars.ts` — hand-authored skeleton (Getting Started, `lpc/`, Historical); splices in the generated trees.
+- `sidebars.generated.json` — generated by `gen_sidebar.py` from the reference trees (`efun/`, `apply/`, `stdlib/`, `concepts/`, `driver/`, `cli/`) plus `sidebar_meta.json` (curated labels, descriptions, ordering). **Do not hand-edit.**
+
+The reference trees have no `index.md` files; each category's landing page is a Docusaurus
+`generated-index` card page. After adding/removing/moving a page, run `python3 docs/gen_sidebar.py`
+and commit the result — CI fails if it is stale.
+
+Sidebar entries use Docusaurus doc IDs (relative file path without extension), not `.html` URLs:
+
+```ts
+// Category with a hand-written landing page:
+{ type: 'category', label: 'Types', link: { type: 'doc', id: 'lpc/types/index' }, items: [...] }
+
+// Category with an auto-generated card landing page (in sidebars.generated.json):
+{ type: 'category', label: 'Arrays', link: { type: 'generated-index', title: 'Arrays', slug: '/efun/arrays/', description: '...' }, items: [...] }
+
+// Simple doc entry:
+{ type: 'doc', id: 'efun/filesystem/stat', label: 'stat' }
+```
+
+### Markdown Compatibility
+
+`.md` files use standard CommonMark (not MDX). However, bare `{...}` in prose text is still parsed as a JSX expression and will fail the SSG build. Escape it as `\{...\}` when it appears outside a fenced code block.
+
+Prefer **extension-less relative links** (`[clone_object](../objects/clone_object)`) over `.md`-file links: a `.md` link on an English page breaks the `zh-CN` locale build whenever the target page has a Chinese translation.
+
+### Chinese Docs (i18n)
+
+Chinese translations live under `i18n/zh-CN/docusaurus-plugin-content-docs/current/`, mirroring the English tree layout exactly (translation of `efun/arrays/allocate.md` goes at the same relative path). Served at `/zh-CN/`; untranslated pages fall back to English. Sidebar/navbar/footer label translations are in `i18n/zh-CN/docusaurus-plugin-content-docs/current.json` and `i18n/zh-CN/docusaurus-theme-classic/*.json` — after sidebar changes, rescaffold keys with `npx docusaurus write-translations --locale zh-CN` and translate any new entries.
 
 ## Contributing Documentation
 
@@ -486,8 +549,8 @@ When adding documentation:
 2. **Template:** Use appropriate template (apply/efun/CLI)
 3. **Examples:** Include practical, tested examples
 4. **Cross-refs:** Add relevant see-also links
-5. **Indices:** Update all relevant index files
-6. **Test:** Preview locally with VitePress
+5. **Sidebar:** Regenerate the sidebar (`python3 docs/gen_sidebar.py`) if you added/removed/moved pages
+6. **Test:** Preview locally (`npm run dev` in `docs/`)
 7. **Commit:** Use clear commit message describing changes
 
 ## Documentation Maintenance Checklist
@@ -497,12 +560,13 @@ When updating documentation:
 - [ ] Check applies list matches `src/vm/internal/applies`
 - [ ] Verify efun specs match package `.spec` files
 - [ ] Confirm CLI tools match `CMakeLists.txt` executables
-- [ ] Validate all index files are up-to-date
+- [ ] Regenerate config docs if `rc.cc` changed (`python3 docs/gen_config_docs.py --check`)
+- [ ] Validate the generated sidebar is up to date (`python3 docs/gen_sidebar.py --check`)
 - [ ] Test code examples for correctness
 - [ ] Check cross-references aren't broken
 - [ ] Verify build instructions match CI workflows
 - [ ] Update version compatibility notes
-- [ ] Preview changes with VitePress local server
+- [ ] Preview changes with Docusaurus dev server
 
 ## Quick Reference
 

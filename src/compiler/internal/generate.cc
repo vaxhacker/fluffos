@@ -3,17 +3,21 @@
 #include "generate.h"
 
 #include <cstdio>
+#include <vector>
+
+#include <nlohmann/json.hpp>  // lpcc --ast --json envelope
 
 #include "include/function.h"  // for F_SIMUL etc , FIXME
 #include "efuns.autogen.h"
+#include "keyword.h"                  // predefs[]: FP_EFUN name resolution
 #include "vm/internal/base/number.h"  // for formatting lpc int
 
 #include "compiler.h"  // for CURRENT_PROGRAM_SIZE
-#include "lex.h"       // for pragmas
+#include "lexer.h"     // for pragmas
 #include "icode.h"     // for IS_NODE.
 
-static parse_node_t *optimize(parse_node_t * /*expr*/);
-static parse_node_t **last_local_refs = nullptr;
+static parse_node_t* optimize(parse_node_t* /*expr*/);
+static parse_node_t** last_local_refs = nullptr;
 static int optimizer_num_locals;
 
 /* Document optimizations here so we can make sure they don't interfere.
@@ -30,7 +34,7 @@ static int optimizer_num_locals;
  * doesn't get optimized.
  */
 
-static void optimize_expr_list(parse_node_t *expr) {
+static void optimize_expr_list(parse_node_t* expr) {
   if (!expr) {
     return;
   }
@@ -39,7 +43,7 @@ static void optimize_expr_list(parse_node_t *expr) {
   } while ((expr = expr->r.expr));
 }
 
-static void optimize_lvalue_list(parse_node_t *expr) {
+static void optimize_lvalue_list(parse_node_t* expr) {
   while ((expr = expr->r.expr)) {
     expr->v.expr = optimize(expr->l.expr);
   }
@@ -50,10 +54,37 @@ static void optimize_lvalue_list(parse_node_t *expr) {
 #define OPTIMIZER_IN_COND 2 /* switch or if or ?: */
 static int optimizer_state = 0;
 
-static parse_node_t *optimize(parse_node_t *expr) {
+namespace {
+// Mirrors the guard in icode.cc's i_generate_node(): a left-nested chain
+// of binary/unary/ternary operators builds a parse tree as deep as the
+// input, with no bound from the grammar/parser. The NODE_TWO_VALUES case
+// below walks its own chain (one node per top-level definition/statement)
+// iteratively rather than recursing, so this cap bounds genuine
+// expression nesting only -- never an object's definition or statement
+// count (github.com/fluffos/fluffos/issues/1267).
+//
+// Unlike i_generate_node(), going over is not a compile error: skipping
+// optimization of a subtree still leaves correct (just less tight)
+// bytecode, so this only warns and gives up on that subtree.
+int g_optimize_depth = 0;
+constexpr int kMaxOptimizeDepth = 500;
+}  // namespace
+
+/* Is `n` a slot the optimizer's per-function scratch actually covers? */
+static bool optimizer_local_slot(int n) {
+  return last_local_refs != nullptr && n >= 0 && n < optimizer_num_locals;
+}
+
+static parse_node_t* optimize(parse_node_t* expr) {
   if (!expr) {
     return nullptr;
   }
+  if (++g_optimize_depth > kMaxOptimizeDepth) {
+    --g_optimize_depth;
+    yywarn("Expression nested too deeply to fully optimize.");
+    return expr;
+  }
+  DEFER { --g_optimize_depth; };
 
   switch (expr->kind) {
     case NODE_TERNARY_OP:
@@ -68,7 +99,7 @@ static parse_node_t *optimize(parse_node_t *expr) {
           if (!optimizer_state) {
             int x = expr->r.expr->l.number;
 
-            if (last_local_refs[x]) {
+            if (optimizer_local_slot(x) && last_local_refs[x]) {
               last_local_refs[x]->v.number = F_TRANSFER_LOCAL;
               last_local_refs[x] = nullptr;
             }
@@ -94,6 +125,15 @@ static parse_node_t *optimize(parse_node_t *expr) {
     case NODE_UNARY_OP_1:
       OPT(expr->r.expr);
       if (expr->v.number == F_VOID_ASSIGN_LOCAL) {
+        /* A local index the scratch array was not sized for. It should not
+         * happen (generate_function() sizes it from the function's local
+         * count), but the array is a peephole optimisation only, so degrade
+         * to "no peephole" rather than reading off the end -- a tree that
+         * out-counts its function crashed the driver at compile time once
+         * already (__INIT, see compile_max_num_locals in compiler.cc). */
+        if (!optimizer_local_slot(expr->l.number)) {
+          break;
+        }
         if (last_local_refs[expr->l.number] && !optimizer_state) {
           last_local_refs[expr->l.number]->v.number = F_TRANSFER_LOCAL;
           last_local_refs[expr->l.number] = nullptr;
@@ -102,6 +142,9 @@ static parse_node_t *optimize(parse_node_t *expr) {
       break;
     case NODE_OPCODE_1:
       if (expr->v.number == F_LOCAL || expr->v.number == F_LOCAL_LVALUE) {
+        if (!optimizer_local_slot(expr->l.number)) {
+          break;
+        }
         if (expr->v.number == F_LOCAL) {
           if (!optimizer_state) {
             last_local_refs[expr->l.number] = expr;
@@ -138,10 +181,26 @@ static parse_node_t *optimize(parse_node_t *expr) {
     case NODE_CALL:
       optimize_expr_list(expr->r.expr);
       break;
-    case NODE_TWO_VALUES:
-      OPT(expr->l.expr);
-      OPT(expr->r.expr);
+    case NODE_TWO_VALUES: {
+      // Same chain, same reason to flatten it, as icode.cc's
+      // i_generate_node() (see there). optimize() never replaces a
+      // NODE_TWO_VALUES node's identity, so a stack of *slots* (rather
+      // than values), with each leaf's optimized replacement written
+      // back into its own slot, is equivalent to the recursive form.
+      std::vector<parse_node_t**> work{&expr->r.expr, &expr->l.expr};
+      while (!work.empty()) {
+        parse_node_t** slot = work.back();
+        work.pop_back();
+        parse_node_t* node = *slot;
+        if (node && node->kind == NODE_TWO_VALUES) {
+          work.push_back(&node->r.expr);
+          work.push_back(&node->l.expr);
+        } else {
+          OPT(*slot);
+        }
+      }
       break;
+    }
     case NODE_CONTROL_JUMP:
     case NODE_PARAMETER:
     case NODE_PARAMETER_LVALUE:
@@ -190,6 +249,7 @@ static parse_node_t *optimize(parse_node_t *expr) {
       break;
     }
     case NODE_CATCH:
+    case NODE_ACATCH:
       OPT(expr->r.expr);
       break;
     case NODE_LVALUE_EFUN:
@@ -230,13 +290,15 @@ static parse_node_t *optimize(parse_node_t *expr) {
   return expr;
 }
 
-ADDRESS_TYPE generate(parse_node_t *node) {
+ADDRESS_TYPE generate(parse_node_t* node) {
   ADDRESS_TYPE where = CURRENT_PROGRAM_SIZE;
 
   if (num_parse_error) {
     return 0;
   }
-  { i_generate_node(node); }
+  {
+    i_generate_node(node);
+  }
   free_tree();
 
   return where;
@@ -244,14 +306,15 @@ ADDRESS_TYPE generate(parse_node_t *node) {
 
 static void optimizer_start_function(int n) {
   if (n) {
-    last_local_refs = reinterpret_cast<parse_node_t **>(
-        DCALLOC(n, sizeof(parse_node_t *), TAG_COMPILER, "c_start_function"));
+    last_local_refs = reinterpret_cast<parse_node_t**>(
+        DCALLOC(n, sizeof(parse_node_t*), TAG_COMPILER, "c_start_function"));
     optimizer_num_locals = n;
     while (n--) {
       last_local_refs[n] = nullptr;
     }
   } else {
     last_local_refs = nullptr;
+    optimizer_num_locals = 0;
   }
 }
 
@@ -268,7 +331,7 @@ static void optimizer_end_function(void) {
   }
 }
 
-ADDRESS_TYPE generate_function(function_t *f, parse_node_t *node, int num) {
+ADDRESS_TYPE generate_function(function_t* f, parse_node_t* node, int num) {
   ADDRESS_TYPE ret;
   if (pragmas & PRAGMA_OPTIMIZE) {
     optimizer_start_function(num);
@@ -280,7 +343,7 @@ ADDRESS_TYPE generate_function(function_t *f, parse_node_t *node, int num) {
   return ret;
 }
 
-int node_always_true(parse_node_t *node) {
+int node_always_true(parse_node_t* node) {
   if (!node) {
     return 1;
   }
@@ -290,7 +353,7 @@ int node_always_true(parse_node_t *node) {
   return 0;
 }
 
-int generate_conditional_branch(parse_node_t *node) {
+int generate_conditional_branch(parse_node_t* node) {
   int branch;
 
   if (!node) {
@@ -338,23 +401,55 @@ int generate_conditional_branch(parse_node_t *node) {
 
 // FIXME: originally found in generate.cc
 
-#ifdef DEBUG
-const char *lpc_tree_name[] = {"return",        "two values",    "opcode",
-                               "opcode_1",      "opcode_2",      "unary op",
-                               "unary op_1",    "binary op",     "binary op_1",
-                               "ternary op",    "ternary op_1",  "control jump",
-                               "loop",          "call",          "call_1",
-                               "call_2",        "&& ||",         "nullish",
-                               "logical assign", "foreach",       "lvalue_efun",
-                               "switch_range",  "switch_string", "switch_direct",
-                               "switch_number", "case_number",   "case_string",
-                               "default",       "if",            "branch link",
-                               "parameter",     "parameter_lvalue", "efun",
-                               "anon func",     "real",          "number",
-                               "string",        "function",      "catch"};
+// (Unconditional: lpcc --ast ships dump_tree in every build type.)
+const char* lpc_tree_name[] = {"return",
+                               "two values",
+                               "opcode",
+                               "opcode_1",
+                               "opcode_2",
+                               "unary op",
+                               "unary op_1",
+                               "binary op",
+                               "binary op_1",
+                               "ternary op",
+                               "ternary op_1",
+                               "control jump",
+                               "loop",
+                               "call",
+                               "call_1",
+                               "call_2",
+                               "&& ||",
+                               "nullish",
+                               "logical assign",
+                               "foreach",
+                               "lvalue_efun",
+                               "switch_range",
+                               "switch_string",
+                               "switch_direct",
+                               "switch_number",
+                               "case_number",
+                               "case_string",
+                               "default",
+                               "if",
+                               "branch link",
+                               "parameter",
+                               "parameter_lvalue",
+                               "efun",
+                               "anon func",
+                               "real",
+                               "number",
+                               "string",
+                               "function",
+                               "catch",
+                               /* keep in step with trees.h's node-kind enum:
+                                * lpc_tree_form() indexes this table by kind
+                                * for NODE_CATCH/NODE_ACATCH, so a missing
+                                * entry is an out-of-bounds read (__TREE__ of
+                                * an acatch segfaulted on Debug builds) */
+                               "acatch"};
 
-static void lpc_tree(parse_node_t *dest, int num) {
-  parse_node_t *pn;
+static void lpc_tree(parse_node_t* dest, int num) {
+  parse_node_t* pn;
 
   dest->kind = NODE_CALL;
   dest->v.number = F_AGGREGATE;
@@ -377,21 +472,21 @@ static void lpc_tree(parse_node_t *dest, int num) {
   }
 }
 
-static void lpc_tree_number(parse_node_t *dest, LPC_INT num) { CREATE_NUMBER(dest->v.expr, num); }
+static void lpc_tree_number(parse_node_t* dest, LPC_INT num) { CREATE_NUMBER(dest->v.expr, num); }
 
-static void lpc_tree_real(parse_node_t *dest, LPC_FLOAT real) { CREATE_REAL(dest->v.expr, real); }
+static void lpc_tree_real(parse_node_t* dest, LPC_FLOAT real) { CREATE_REAL(dest->v.expr, real); }
 
-static void lpc_tree_expr(parse_node_t *dest, parse_node_t *expr) {
+static void lpc_tree_expr(parse_node_t* dest, parse_node_t* expr) {
   dest->v.expr = new_node_no_line();
   lpc_tree_form(expr, dest->v.expr);
 }
 
-static void lpc_tree_string(parse_node_t *dest, const char *str) {
+static void lpc_tree_string(parse_node_t* dest, const char* str) {
   CREATE_STRING(dest->v.expr, str);
 }
 
-static void lpc_tree_list(parse_node_t *dest, parse_node_t *expr) {
-  parse_node_t *pn;
+static void lpc_tree_list(parse_node_t* dest, parse_node_t* expr) {
+  parse_node_t* pn;
   int num = 0;
 
   pn = expr;
@@ -418,273 +513,379 @@ static void lpc_tree_list(parse_node_t *dest, parse_node_t *expr) {
 #define ARG_4 dest->r.expr->r.expr->r.expr->r.expr
 #define ARG_5 dest->r.expr->r.expr->r.expr->r.expr->r.expr
 
-void dump_expr_list(parse_node_t *expr) {
-  if (!expr) {
-    return;
+// dump_tree (lpcc --ast text form) renders the SAME model the --json mode
+// emits (ast_json below): one switch, two renderings -- the S-expression
+// text is `(label scalars children...)` with seq nodes spliced flat, which
+// is shape-compatible with the historical hand-printed form.
+static void render_sexpr(const nlohmann::json& n);
+
+static void render_sexpr_children(const nlohmann::json& n, bool* first) {
+  if (n.contains("a")) {
+    for (const auto& a : n["a"]) {
+      if (!*first) printf(" ");
+      *first = false;
+      if (a.is_string()) {
+        printf("%s", a.get<std::string>().c_str());
+      } else {
+        printf("%s", a.dump().c_str());
+      }
+    }
   }
-  do {
-    dump_tree(expr->v.expr);
-  } while ((expr = expr->r.expr));
+  if (n.contains("c")) {
+    for (const auto& c : n["c"]) {
+      if (!*first) printf(" ");
+      *first = false;
+      render_sexpr(c);
+    }
+  }
 }
 
-static void dump_lvalue_list(parse_node_t *expr) {
-  printf("(lvalue_list ");
-  while ((expr = expr->r.expr)) {
-    dump_tree(expr->l.expr);
+static void render_sexpr(const nlohmann::json& n) {
+  const std::string k = n.value("k", "");
+  if (k == "seq") {
+    // sequencing node: splice children flat, like the historical dump
+    bool first = true;
+    if (n.contains("c")) {
+      for (const auto& c : n["c"]) {
+        if (!first) printf(" ");
+        first = false;
+        render_sexpr(c);
+      }
+    }
+    return;
+  }
+  printf("(%s", k.c_str());
+  bool firstitem = false;  // label already printed; separate items with ' '
+  render_sexpr_children(n, &firstitem);
+  printf(")");
+}
+
+// --- lpcc --ast --json ------------------------------------------------------
+//
+// Structured mirror of dump_tree. Node schema (keys omitted when empty):
+//   {"k": label, "l": source line, "a": [scalar operands], "c": [children]}
+// NODE_TWO_VALUES is a pure sequencing node; it renders as {"k":"seq"} with
+// nested sequences spliced flat, matching the S-expression form's implicit
+// concatenation. Kept adjacent to dump_tree ON PURPOSE: any new NODE_* case
+// added there must be added here (both are driven by the same switch shape).
+
+static nlohmann::json ast_json(parse_node_t* expr);
+
+static void ast_json_children(nlohmann::json& node, parse_node_t* expr) {
+  // dump_expr_list: right-linked list of v.expr items
+  while (expr) {
+    node["c"].push_back(ast_json(expr->v.expr));
+    expr = expr->r.expr;
   }
 }
 
-void dump_tree(parse_node_t *expr) {
-  if (!expr) {
-    return;
+static void ast_json_seq(nlohmann::json& arr, parse_node_t* expr) {
+  // Same NODE_TWO_VALUES chain (one node per top-level definition/statement)
+  // that i_generate_node()/optimize() flatten iteratively instead of
+  // recursing -- walking it recursively here would scale C-stack depth with
+  // an object's definition/statement count, not just genuine expression
+  // nesting (github.com/fluffos/fluffos/issues/1267). Push right-then-left
+  // so popping (left-to-right) preserves the original recursive order.
+  std::vector<parse_node_t*> work{expr};
+  while (!work.empty()) {
+    parse_node_t* node = work.back();
+    work.pop_back();
+    if (!node) continue;
+    if (node->kind == NODE_TWO_VALUES) { // splice nested sequences flat
+      work.push_back(node->r.expr);
+      work.push_back(node->l.expr);
+    } else {
+      arr.push_back(ast_json(node));
+    }
   }
+}
+
+namespace {
+// Mirrors optimize()'s guard (see above): ast_json() is a third recursive
+// walker over the same parse-tree shape as optimize()/i_generate_node(), for
+// `lpcc --ast`/`--ast --json`, and runs BEFORE codegen -- so without its own
+// cap it can stack-overflow on a pathologically deep (non-constant-foldable)
+// expression before optimize()'s own cap ever gets a chance to reject it.
+// Diagnostic output only, so going over just truncates the subtree instead
+// of failing anything.
+int g_ast_json_depth = 0;
+constexpr int kMaxAstJsonDepth = 500;
+}  // namespace
+
+static nlohmann::json ast_json(parse_node_t* expr) {
+  nlohmann::json n = nlohmann::json::object();
+  if (!expr) {
+    n["k"] = "nil";
+    return n;
+  }
+  if (++g_ast_json_depth > kMaxAstJsonDepth) {
+    --g_ast_json_depth;
+    n["k"] = "too_deep";
+    return n;
+  }
+  DEFER { --g_ast_json_depth; };
+  if (expr->line > 0) n["l"] = expr->line;
+  auto kids = [&](parse_node_t* e) { if (e) n["c"].push_back(ast_json(e)); };
+  auto scalar = [&](LPC_INT v) { n["a"].push_back(v); };
+  const auto instr_name = [](int op) { return instrs[op & ~NOVALUE_USED_FLAG].name; };
+
   switch (expr->kind) {
     case NODE_TERNARY_OP:
-      printf("(%s ", instrs[expr->r.expr->v.number].name);
-      dump_tree(expr->l.expr);
-      expr = expr->r.expr;
-      dump_tree(expr->l.expr);
-      dump_tree(expr->r.expr);
-      printf(")");
+    case NODE_TERNARY_OP_1:
+      n["k"] = instr_name(expr->r.expr->v.number);
+      if (expr->kind == NODE_TERNARY_OP_1) scalar(expr->type);
+      kids(expr->l.expr);
+      kids(expr->r.expr->l.expr);
+      kids(expr->r.expr->r.expr);
       break;
     case NODE_BINARY_OP:
-      printf("(%s ", instrs[expr->v.number].name);
-      dump_tree(expr->l.expr);
-      dump_tree(expr->r.expr);
-      printf(")");
+    case NODE_BINARY_OP_1:
+      n["k"] = instr_name(expr->v.number);
+      if (expr->kind == NODE_BINARY_OP_1) scalar(expr->type);
+      kids(expr->l.expr);
+      kids(expr->r.expr);
       break;
     case NODE_UNARY_OP:
-      printf("(%s ", instrs[expr->v.number].name);
-      dump_tree(expr->r.expr);
-      printf(")");
-      break;
-    case NODE_OPCODE:
-      printf("(%s)", instrs[expr->v.number].name);
-      break;
-    case NODE_TERNARY_OP_1: {
-      int p = expr->type;
-      printf("(%s ", instrs[expr->r.expr->v.number].name);
-      dump_tree(expr->l.expr);
-      expr = expr->r.expr;
-      dump_tree(expr->l.expr);
-      dump_tree(expr->r.expr);
-      printf(" %i)", p);
-      break;
-    }
-    case NODE_BINARY_OP_1:
-      printf("(%s ", instrs[expr->v.number].name);
-      dump_tree(expr->l.expr);
-      dump_tree(expr->r.expr);
-      printf(" %i)", expr->type);
+      n["k"] = instr_name(expr->v.number);
+      kids(expr->r.expr);
       break;
     case NODE_UNARY_OP_1:
-      printf("(%s ", instrs[expr->v.number].name);
-      dump_tree(expr->r.expr);
-      printf(" %" LPC_INT_FMTSTR_P ")", expr->l.number);
+      n["k"] = instr_name(expr->v.number);
+      scalar(expr->l.number);
+      kids(expr->r.expr);
+      break;
+    case NODE_OPCODE:
+      n["k"] = instr_name(expr->v.number);
       break;
     case NODE_OPCODE_1:
-      printf("(%s %" LPC_INT_FMTSTR_P ")", instrs[expr->v.number].name, expr->l.number);
+      n["k"] = instr_name(expr->v.number);
+      scalar(expr->l.number);
       break;
     case NODE_OPCODE_2:
-      printf("(%s %" LPC_INT_FMTSTR_P " %" LPC_INT_FMTSTR_P ")", instrs[expr->v.number].name,
-             expr->l.number, expr->r.number);
+      n["k"] = instr_name(expr->v.number);
+      scalar(expr->l.number);
+      scalar(expr->r.number);
       break;
     case NODE_RETURN:
-      if (expr->r.expr) {
-        printf("(return ");
-        dump_tree(expr->r.expr);
-        printf(")");
-      } else {
-        printf("(return_zero)");
-      }
+      n["k"] = expr->r.expr ? "return" : "return_zero";
+      kids(expr->r.expr);
       break;
     case NODE_STRING:
-      printf("(string %" LPC_INT_FMTSTR_P ")", expr->v.number);
+      n["k"] = "string";
+      scalar(expr->v.number); // string-table index; resolve via dump_prog STRINGS
       break;
     case NODE_REAL:
-      printf("(real %" LPC_FLOAT_FMTSTR_P ")", expr->v.real);
+      n["k"] = "real";
+      n["a"].push_back(expr->v.real);
       break;
     case NODE_NUMBER:
-      printf("(number %" LPC_INT_FMTSTR_P ")", expr->v.number);
+      n["k"] = "number";
+      scalar(expr->v.number);
       break;
     case NODE_LAND_LOR:
-      if (expr->v.number == F_LAND) {
-        printf("(&& ");
-      } else {
-        printf("(|| ");
-      }
-      dump_tree(expr->l.expr);
-      dump_tree(expr->r.expr);
-      printf(")");
+      n["k"] = (expr->v.number == F_LAND) ? "&&" : "||";
+      kids(expr->l.expr);
+      kids(expr->r.expr);
       break;
     case NODE_NULLISH:
-      printf("(?? ");
-      dump_tree(expr->l.expr);
-      dump_tree(expr->r.expr);
-      printf(")");
+      n["k"] = "??";
+      kids(expr->l.expr);
+      kids(expr->r.expr);
       break;
     case NODE_LOGICAL_ASSIGN:
-      printf("(%s ", instrs[expr->v.number].name);
-      dump_tree(expr->l.expr);
-      dump_tree(expr->r.expr);
-      printf(")");
-      break;
     case NODE_BRANCH_LINK:
-      printf("(branch_link ");
-      dump_tree(expr->l.expr);
-      dump_tree(expr->r.expr);
-      printf(")");
+      n["k"] = expr->kind == NODE_BRANCH_LINK ? "branch_link" : instr_name(expr->v.number);
+      kids(expr->l.expr);
+      kids(expr->r.expr);
       break;
     case NODE_CALL_2:
-      printf("(%s %" LPC_INT_FMTSTR_P " %" LPC_INT_FMTSTR_P " %i ", instrs[expr->v.number].name,
-             expr->l.number >> 16, expr->l.number & 0xffff,
-             (expr->r.expr ? expr->r.expr->kind : 0));
-      dump_expr_list(expr->r.expr);
-      printf(")");
+      n["k"] = instr_name(expr->v.number);
+      scalar(expr->l.number >> 16);
+      scalar(expr->l.number & 0xffff);
+      ast_json_children(n, expr->r.expr);
       break;
     case NODE_CALL_1:
-      printf("(%s %" LPC_INT_FMTSTR_P " %i ", instrs[expr->v.number].name, expr->l.number,
-             (expr->r.expr ? expr->r.expr->kind : 0));
-      dump_expr_list(expr->r.expr);
-      printf(")");
+      n["k"] = instr_name(expr->v.number);
+      scalar(expr->l.number);
+      ast_json_children(n, expr->r.expr);
       break;
     case NODE_CALL:
-      printf("(%s %" LPC_INT_FMTSTR_P " ", instrs[expr->v.number].name, expr->l.number);
-      dump_expr_list(expr->r.expr);
-      printf(")");
+      n["k"] = instr_name(expr->v.number);
+      scalar(expr->l.number);
+      ast_json_children(n, expr->r.expr);
       break;
     case NODE_TWO_VALUES:
-      dump_tree(expr->l.expr);
-      dump_tree(expr->r.expr);
+      n["k"] = "seq";
+      ast_json_seq(n["c"], expr->l.expr);
+      ast_json_seq(n["c"], expr->r.expr);
       break;
     case NODE_CONTROL_JUMP:
-      if (expr->v.number == CJ_BREAK_SWITCH) {
-        printf("(break_switch)");
-      } else if (expr->v.number == CJ_BREAK) {
-        printf("(break)");
-      } else if (expr->v.number == CJ_CONTINUE) {
-        printf("(continue)");
-      } else {
-        printf("(UNKNOWN CONTROL JUMP)");
-      }
+      n["k"] = (expr->v.number == CJ_BREAK_SWITCH) ? "break_switch"
+               : (expr->v.number == CJ_BREAK)      ? "break"
+               : (expr->v.number == CJ_CONTINUE)   ? "continue"
+                                                   : "unknown_control_jump";
       break;
     case NODE_PARAMETER:
-      printf("(parameter %" LPC_INT_FMTSTR_P ")", expr->v.number);
+      n["k"] = "parameter";
+      scalar(expr->v.number);
       break;
     case NODE_PARAMETER_LVALUE:
-      printf("(parameter_lvalue %" LPC_INT_FMTSTR_P ")", expr->v.number);
+      n["k"] = "parameter_lvalue";
+      scalar(expr->v.number);
       break;
     case NODE_IF:
-      printf("(if ");
-      dump_tree(expr->v.expr);
-      printf("\n");
-      dump_tree(expr->l.expr);
-      if (expr->r.expr) {
-        printf("\n");
-        dump_tree(expr->r.expr);
-      }
-      printf(")\n");
+      n["k"] = "if";
+      kids(expr->v.expr);
+      kids(expr->l.expr);
+      kids(expr->r.expr);
       break;
     case NODE_LOOP:
-      printf("(loop %i\n", expr->type);
-      dump_tree(expr->v.expr);
-      printf("\n");
-      dump_tree(expr->l.expr);
-      printf("\n");
-      dump_tree(expr->r.expr);
-      printf(")\n");
+      n["k"] = "loop";
+      scalar(expr->type);
+      kids(expr->v.expr);
+      kids(expr->l.expr);
+      kids(expr->r.expr);
       break;
     case NODE_FOREACH:
-      printf("(foreach ");
-      dump_tree(expr->l.expr);
-      dump_tree(expr->r.expr);
-      dump_tree(expr->v.expr);
-      printf(")\n");
+      n["k"] = "foreach";
+      kids(expr->l.expr);
+      kids(expr->r.expr);
+      kids(expr->v.expr);
       break;
     case NODE_CASE_NUMBER:
     case NODE_CASE_STRING:
-      printf("(case)");
+      n["k"] = "case";
       break;
     case NODE_DEFAULT:
-      printf("(default)");
+      n["k"] = "default";
       break;
     case NODE_SWITCH_STRINGS:
     case NODE_SWITCH_NUMBERS:
     case NODE_SWITCH_DIRECT:
     case NODE_SWITCH_RANGES:
-      printf("(switch ");
-      dump_tree(expr->l.expr);
-      dump_tree(expr->r.expr);
-      printf(")");
+      n["k"] = "switch";
+      kids(expr->l.expr);
+      kids(expr->r.expr);
       break;
     case NODE_CATCH:
-      printf("(catch ");
-      dump_tree(expr->r.expr);
-      printf(")");
+      n["k"] = "catch";
+      kids(expr->r.expr);
       break;
-    case NODE_LVALUE_EFUN:
-      printf("(lvalue_efun ");
-      dump_tree(expr->l.expr);
-      dump_lvalue_list(expr->r.expr);
-      printf(")");
+    case NODE_ACATCH:
+      n["k"] = "acatch";
+      kids(expr->r.expr);
       break;
-    case NODE_FUNCTION_CONSTRUCTOR:
-      printf("(function %" LPC_INT_FMTSTR_P " ", expr->v.number & 0xff);
-      if (expr->r.expr) {
-        printf("(array ");
-        dump_expr_list(expr->r.expr);
-        printf(")");
-      } else {
-        printf("(number 0)");
-      }
+    case NODE_LVALUE_EFUN: {
+      n["k"] = "lvalue_efun";
+      kids(expr->l.expr);
+      parse_node_t* lv = expr->r.expr;
+      while (lv && (lv = lv->r.expr)) n["c"].push_back(ast_json(lv->l.expr));
+      break;
+    }
+    case NODE_FUNCTION_CONSTRUCTOR: {
+      n["k"] = "functional";
+      scalar(expr->v.number & 0xff);
+      scalar(expr->v.number >> 8);
+      if (expr->r.expr) ast_json_children(n, expr->r.expr);
       switch (expr->v.number & 0xff) {
-        case FP_SIMUL:
-          printf("(fp-simul %" LPC_INT_FMTSTR_P ")", expr->v.number >> 8);
-          break;
-        case FP_LOCAL:
-          printf("(fp-local %" LPC_INT_FMTSTR_P ")", expr->v.number >> 8);
-          break;
         case FP_EFUN:
-          printf("(fp-efun %s)", instrs[expr->v.number >> 8].name);
+          // At AST time v.number>>8 is a predefs[] index (icode translates
+          // it to the instruction via predefs[idx].token when emitting).
+          // Resolving it against instrs[] directly printed an unrelated,
+          // build-dependent opcode name for every (: efun :) node.
+          n["a"].push_back(predefs[expr->v.number >> 8].word);
           break;
         case FP_FUNCTIONAL:
         case FP_FUNCTIONAL | FP_NOT_BINDABLE:
-          printf("(fp-functional %" LPC_INT_FMTSTR_P " ", expr->v.number >> 8);
-          dump_tree(expr->l.expr);
-          printf(")");
+          kids(expr->l.expr);
           break;
       }
-      printf(" %" LPC_INT_FMTSTR_P ")", expr->v.number >> 8);
       break;
+    }
     case NODE_ANON_FUNC:
-      printf("(anon-func %" LPC_INT_FMTSTR_P " %" LPC_INT_FMTSTR_P " ", expr->v.number,
-             expr->l.number);
-      dump_tree(expr->r.expr);
-      printf(")");
+      n["k"] = "anon_func";
+      scalar(expr->v.number);
+      scalar(expr->l.number);
+      kids(expr->r.expr);
       break;
     case NODE_EFUN:
-      printf("(efun %s ", instrs[expr->v.number & ~NOVALUE_USED_FLAG].name);
-      dump_expr_list(expr->r.expr);
-      printf(")");
+      n["k"] = "efun";
+      n["a"].push_back(instr_name(expr->v.number));
+      ast_json_children(n, expr->r.expr);
       break;
     case NODE_FUNCTION:
-      printf("(function ");
-      dump_tree(expr->r.expr);
-      printf(")");
+      n["k"] = "function";
+      scalar(expr->v.number); // function index
+      kids(expr->r.expr);
       break;
     default:
-      printf("(unknown: %d)", expr->kind);
+      n["k"] = "unknown";
+      scalar(expr->kind);
       break;
+  }
+  return n;
+}
+
+void dump_tree(parse_node_t* expr) {
+  nlohmann::json roots = nlohmann::json::array();
+  ast_json_seq(roots, expr);
+  bool first = true;
+  for (const auto& r : roots) {
+    if (!first) printf("\n");
+    first = false;
+    render_sexpr(r);
   }
 }
 
-void lpc_tree_form(parse_node_t *expr, parse_node_t *dest) {
+void dump_program_ast_json(const char* filename, parse_node_t* tree_main,
+                           parse_node_t* tree_init) {
+  nlohmann::json envelope = {
+      {"fluffos_lpcc", 1},
+      {"stage", "ast"},
+      {"file", filename != nullptr ? filename : "?"},
+      {"trees", nlohmann::json::array()},
+  };
+  nlohmann::json main_roots = nlohmann::json::array();
+  ast_json_seq(main_roots, tree_main);
+  nlohmann::json init_roots = nlohmann::json::array();
+  ast_json_seq(init_roots, tree_init);
+  envelope["trees"].push_back({{"title", "TREE_MAIN"}, {"roots", main_roots}});
+  envelope["trees"].push_back({{"title", "TREE_INIT"}, {"roots", init_roots}});
+  // Filenames/instr names are ASCII, but stay consistent with the other
+  // envelopes: never throw on stray bytes.
+  printf("%s\n",
+         envelope.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace).c_str());
+}
+
+namespace {
+// Mirrors ast_json()'s guard (see above): lpc_tree_form()/lpc_tree_expr()
+// are a FOURTH mutually-recursive walker over the same parse-tree shape as
+// optimize()/i_generate_node()/ast_json(), backing the DEBUG-only `tree`
+// keyword's pretty-printer (grammar_rules.cc's rule_tree_block()/
+// rule_tree_expr()) -- found missing its own cap by AFL++ fuzzing the
+// compiler (a deeply-nested expression inside `tree(...)` C-stack-overflows
+// here). Diagnostic output only, so going over just renders the subtree as
+// a placeholder leaf instead of failing anything -- same tradeoff ast_json()
+// makes, for the same reason (github.com/fluffos/fluffos/issues/1267).
+int g_lpc_tree_depth = 0;
+constexpr int kMaxLpcTreeDepth = 500;
+}  // namespace
+
+void lpc_tree_form(parse_node_t* expr, parse_node_t* dest) {
   if (!expr) {
     dest->kind = NODE_NUMBER;
     dest->type = TYPE_ANY;
     dest->v.number = 0;
     return;
   }
+  if (++g_lpc_tree_depth > kMaxLpcTreeDepth) {
+    --g_lpc_tree_depth;
+    dest->kind = NODE_NUMBER;
+    dest->type = TYPE_ANY;
+    dest->v.number = 0;
+    return;
+  }
+  DEFER { --g_lpc_tree_depth; };
 
   switch (expr->kind) {
     case NODE_TERNARY_OP:
@@ -803,6 +1004,7 @@ void lpc_tree_form(parse_node_t *expr, parse_node_t *dest) {
       lpc_tree_expr(ARG_3, expr->r.expr);
       break;
     case NODE_CATCH:
+    case NODE_ACATCH:
       lpc_tree(dest, 2);
       lpc_tree_expr(ARG_2, expr->r.expr);
       break;
@@ -824,4 +1026,3 @@ void lpc_tree_form(parse_node_t *expr, parse_node_t *dest) {
   }
   lpc_tree_string(ARG_1, lpc_tree_name[expr->kind]);
 }
-#endif

@@ -1,5 +1,4 @@
 ---
-layout: doc
 title: async / async_getdir
 ---
 # async_getdir
@@ -11,6 +10,7 @@ title: async / async_getdir
 ### SYNOPSIS
 
     void async_getdir( string dir, function callback );
+    promise async_getdir( string dir );
 
 ### DESCRIPTION
 
@@ -29,6 +29,16 @@ title: async / async_getdir
             // empty array when no matching files exist
             // array of matching filenames
         }
+
+
+    With the callback OMITTED, returns a promise fulfilled with the sorted
+    array of names -- `string *names = await async_getdir(dir);`.
+
+### NOTE
+
+    When the 'this_player in call_out' driver setting is enabled,
+    this_player() inside the callback is preserved from the time the
+    request was made, like call_out().
 
 ### SEE ALSO
 

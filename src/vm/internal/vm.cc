@@ -15,7 +15,8 @@
 #include "vm/internal/master.h"
 #include "vm/internal/simul_efun.h"
 #include "vm/internal/simulate.h"
-#include "compiler/internal/lex.h"       // for add_predefines, fixme!
+#include "compiler/internal/lexer.h"  // for add_predefines, fixme!
+#include "compiler/internal/lexer_utils.h"
 #include "compiler/internal/compiler.h"  // for init_locals, fixme!
 
 #include "packages/core/add_action.h"
@@ -36,7 +37,7 @@ void preload_objects() {
   push_number(0);
   auto ret = safe_apply_master_ob(APPLY_EPILOG, 1);
 
-  if ((ret == nullptr) || (ret == (svalue_t *)-1) || (ret->type != T_ARRAY)) {
+  if ((ret == nullptr) || (ret == (svalue_t*)-1) || (ret->type != T_ARRAY)) {
     return;
   }
 
@@ -49,13 +50,21 @@ void preload_objects() {
   // so we have to increase ref here to make sure it is around.
   prefiles->ref++;
 
-  debug_message("\nLoading preload files ...\n");
+  // Per-file progress can be silenced with "display preload progress : 0"
+  // (issue #967) so errors don't scroll away between hundreds of names.
+  bool display_progress = CONFIG_INT(__RC_DISPLAY_PRELOAD_PROGRESS__) != 0;
+
+  if (display_progress) {
+    debug_message("\nLoading preload files ...\n");
+  }
 
   for (int i = 0; i < prefiles->size; i++) {
     if (prefiles->item[i].type != T_STRING) {
       continue;
     }
-    debug_message("%s...\n", prefiles->item[i].u.string);
+    if (display_progress) {
+      debug_message("%s...\n", prefiles->item[i].u.string);
+    }
 
     push_svalue(&prefiles->item[i]);
     set_eval(max_eval_cost);
@@ -72,6 +81,7 @@ void vm_init() {
   init_eval(); /* in eval.cc */
 
   init_strings();     /* in stralloc.c */
+  init_instrs();      /* in compiler_utils.cc */
   init_identifiers(); /* in lex.c */
   init_locals();      /* in compiler.c */
 
@@ -96,7 +106,7 @@ void vm_start() {
     init_simul_efun(CONFIG_STR(__SIMUL_EFUN_FILE__));
     debug_message("Loading master file: %s\n", CONFIG_STR(__MASTER_FILE__));
     init_master(CONFIG_STR(__MASTER_FILE__));
-  } catch (const char *) {
+  } catch (const char*) {
     debug_message("The simul_efun (%s) and master (%s) objects must be loadable.\n",
                   CONFIG_STR(__SIMUL_EFUN_FILE__), CONFIG_STR(__MASTER_FILE__));
     debug_message("Please check log files for exact error. \n");
@@ -133,18 +143,25 @@ void clear_state() {
 /* All destructed objects are moved into a sperate linked list,
  * and deallocated after program execution.  */
 // TODO: find where they are
-extern object_t *obj_list_destruct;
+extern object_t* obj_list_destruct;
 void remove_destructed_objects() {
   if (obj_list_replace) {
     replace_programs();
   }
 
   if (obj_list_destruct) {
-    object_t *ob, *next;
-    for (ob = obj_list_destruct; ob; ob = next) {
-      next = ob->next_all;
+    /* Detach the whole queue up front: destruct2() frees object variables,
+     * which can re-enter destruct_object() -- those pushes must land on a
+     * fresh queue for the next sweep instead of being dropped when the head
+     * is cleared afterwards. Each object is unlinked before its destruct2()
+     * so a still-referenced survivor keeps no stale queue link. */
+    object_t* ob = obj_list_destruct;
+    obj_list_destruct = nullptr;
+    object_t* next;
+    for (; ob; ob = next) {
+      next = ob->next_destruct;
+      ob->next_destruct = nullptr;
       destruct2(ob);
     }
-    obj_list_destruct = nullptr;
   }
 } /* remove_destructed_objects() */

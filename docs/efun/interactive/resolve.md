@@ -1,5 +1,4 @@
 ---
-layout: doc
 title: interactive / resolve
 ---
 # resolve
@@ -25,6 +24,12 @@ title: interactive / resolve
     returned.   'address'  will  be  the  domain  name  of  the  host,  and
     'resolved' the dotted decimal ip address.  The unknown value will be  0
     if the lookup failed.
+
+### NOTE
+
+    When the 'this_player in call_out' driver setting is enabled,
+    this_player() inside the callback is preserved from the time the
+    request was made, like call_out().
 
 ### SEE ALSO
 

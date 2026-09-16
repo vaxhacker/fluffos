@@ -1,6 +1,5 @@
 ---
-layout: doc
-title: types / array.2d
+title: types / array
 ---
 # array
 

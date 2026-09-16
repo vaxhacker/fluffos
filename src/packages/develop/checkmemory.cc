@@ -6,11 +6,13 @@
  */
 
 #include "base/package_api.h"
+#include "compiler/internal/lexer_utils.h"
 
 #include "packages/core/file.h"
 #include "packages/core/call_out.h"
 #include "packages/core/outbuf.h"
 #include "packages/core/heartbeat.h"
+#include "packages/core/dns.h"
 #ifdef PACKAGE_PARSER
 #include "packages/parser/parser.h"
 #endif
@@ -26,18 +28,31 @@
 #ifdef PACKAGE_DB
 #include "packages/db/db.h"
 #endif
+#ifdef PACKAGE_FFI
+#include "packages/ffi/ffi.h"
+#endif
 #ifdef PACKAGE_ASYNC
 #include "packages/async/async.h"
 #endif
+#ifdef PACKAGE_JSBRIDGE
+#include "packages/jsbridge/jsbridge.h"
+#endif
+#ifdef PACKAGE_EXTERNAL
+#include "packages/external/external.h"
+#endif
+
+#include <functional>
+#include <unordered_map>
+#include <vector>
 
 #if (defined(DEBUGMALLOC) && defined(DEBUGMALLOC_EXTENSIONS))
 
-void mark_svalue(struct svalue_t *);
-void check_string_stats(struct outbuffer_t *);
+void mark_svalue(struct svalue_t*);
+void check_string_stats(struct outbuffer_t*);
 
 outbuffer_t out;
 
-static const char *sources[] = {"*",
+static const char* sources[] = {"*",
                                 "temporary blocks",
                                 "permanent blocks",
                                 "compiler blocks",
@@ -88,13 +103,24 @@ static const char *sources[] = {"*",
                                 "buffers",
                                 "classes"};
 
-void mark_svalue(svalue_t *sv);
+/* The loop below walks all MAX_TAGS (255) tag slots while this table only
+ * names the low ones, so anything allocated with a higher tag (TAG_PROMISE,
+ * TAG_DEFERS, TAG_PCRE_CACHE, ...) used to hand %s an out-of-bounds pointer
+ * -- a segfault in check_memory(1). Index through source_name(). */
+static const char* source_name(int tag) {
+  if (tag >= 0 && tag < static_cast<int>(sizeof(sources) / sizeof(sources[0]))) {
+    return sources[tag];
+  }
+  return "<other blocks>";
+}
 
-char *dump_debugmalloc(const char *tfn, int mask) {
+void mark_svalue(svalue_t* sv);
+
+char* dump_debugmalloc(const char* tfn, int mask) {
   int j, total = 0, chunks = 0;
-  const char *fn;
-  md_node_t *entry;
-  FILE *fp;
+  const char* fn;
+  md_node_t* entry;
+  FILE* fp;
 
   outbuf_zero(&out);
   fn = check_valid_path(tfn, current_object, "debugmalloc", 1);
@@ -107,7 +133,7 @@ char *dump_debugmalloc(const char *tfn, int mask) {
   }
   fprintf(fp, "%12s %12s %12s %5s %7s %s\n", "id", "gametick", "ptr", "tag", "sz", "desc");
   for (j = 0; j < MD_TABLE_SIZE; j++) {
-    for (entry = table[j]; entry; entry = entry->next) {
+    for (entry = md_chain_decode(table[j]); entry; entry = md_chain_decode(entry->next)) {
       if (!mask || (entry->tag == mask)) {
         fprintf(fp, "%12d %12" PRId64 " %12p %1d:%03d %7d %s\n", entry->id, entry->gametick,
                 PTR(entry), (entry->tag >> 8) & 0xff, entry->tag & 0xff, entry->size, entry->desc);
@@ -139,9 +165,9 @@ char *dump_debugmalloc(const char *tfn, int mask) {
 #endif
 
 #ifdef DEBUGMALLOC_EXTENSIONS
-static void mark_object(object_t *ob) {
+static void mark_object(object_t* ob) {
 #ifndef NO_ADD_ACTION
-  sentence_t *sent;
+  sentence_t* sent;
 #endif
   int i;
 
@@ -151,6 +177,10 @@ static void mark_object(object_t *ob) {
 
   if (ob->obname) {
     DO_MARK(ob->obname, TAG_OBJ_NAME);
+  }
+
+  if (ob->variables) {
+    DO_MARK(ob->variables, TAG_OBJ_VARS);
   }
 
   if (ob->replaced_program) {
@@ -200,9 +230,9 @@ static void mark_object(object_t *ob) {
     outbuf_addv(&out, "can't mark variables; %s is swapped.\n", ob->obname);
 }
 
-static void mark_funp(funptr_t *fp);
+static void mark_funp(funptr_t* fp);
 
-void mark_svalue(svalue_t *sv) {
+void mark_svalue(svalue_t* sv) {
   switch (sv->type) {
     case T_OBJECT:
       sv->u.ob->extra_ref++;
@@ -222,6 +252,9 @@ void mark_svalue(svalue_t *sv) {
     case T_BUFFER:
       sv->u.buf->extra_ref++;
       break;
+    case T_PROMISE:
+      sv->u.prom->extra_ref++;
+      break;
     case T_STRING:
       switch (sv->subtype) {
         case STRING_MALLOC:
@@ -235,7 +268,7 @@ void mark_svalue(svalue_t *sv) {
   }
 }
 
-static void mark_funp(funptr_t *fp) {
+static void mark_funp(funptr_t* fp) {
   if (fp->hdr.args) {
     fp->hdr.args->extra_ref++;
   }
@@ -245,9 +278,7 @@ static void mark_funp(funptr_t *fp) {
   }
   switch (fp->hdr.type) {
     case FP_LOCAL | FP_NOT_BINDABLE:
-      if (fp->hdr.owner) {
-        fp->hdr.owner->prog->extra_func_ref++;
-      }
+      fp->f.local.prog->extra_func_ref++;
       break;
     case FP_FUNCTIONAL:
     case FP_FUNCTIONAL | FP_NOT_BINDABLE:
@@ -256,7 +287,7 @@ static void mark_funp(funptr_t *fp) {
   }
 }
 
-static void mark_sentence(sentence_t *sent) {
+static void mark_sentence(sentence_t* sent) {
   if (sent->flags & V_FUNCTION) {
     if (sent->function.f) {
       sent->function.f->hdr.extra_ref++;
@@ -275,7 +306,7 @@ static void mark_sentence(sentence_t *sent) {
 
 static int print_depth = 0;
 
-static void md_print_array(array_t *vec) {
+static void md_print_array(array_t* vec) {
   int i;
 
   outbuf_add(&out, "({ ");
@@ -310,6 +341,9 @@ static void md_print_array(array_t *vec) {
       case T_FUNCTION:
         outbuf_add(&out, "<function>");
         break;
+      case T_PROMISE:
+        outbuf_add(&out, "<promise>");
+        break;
       case T_MAPPING:
         outbuf_add(&out, "<mapping>");
         break;
@@ -338,26 +372,26 @@ static uint64_t base_overhead = 0;
 /* Compute the correct values of allocd_strings, allocd_bytes, and
  * bytes_distinct_strings based on blocks that are actually allocated.
  */
-void compute_string_totals(uint64_t *asp, uint64_t *abp, uint64_t *bp) {
+void compute_string_totals(uint64_t* asp, uint64_t* abp, uint64_t* bp) {
   int hsh;
-  md_node_t *entry;
-  malloc_block_t *msbl;
-  block_t *ssbl;
+  md_node_t* entry;
+  malloc_block_t* msbl;
+  block_t* ssbl;
 
   *asp = 0;
   *abp = 0;
   *bp = 0;
 
   for (hsh = 0; hsh < MD_TABLE_SIZE; hsh++) {
-    for (entry = table[hsh]; entry; entry = entry->next) {
+    for (entry = md_chain_decode(table[hsh]); entry; entry = md_chain_decode(entry->next)) {
       if (entry->tag == TAG_MALLOC_STRING) {
-        msbl = NODET_TO_PTR(entry, malloc_block_t *);
+        msbl = NODET_TO_PTR(entry, malloc_block_t*);
         *bp += msbl->size + 1;
         *asp += msbl->ref;
         *abp += (uint64_t)(msbl->ref) * (msbl->size + 1);
       }
       if (entry->tag == TAG_SHARED_STRING) {
-        ssbl = NODET_TO_PTR(entry, block_t *);
+        ssbl = NODET_TO_PTR(entry, block_t*);
         *bp += ssbl->size + 1;
         *asp += ssbl->refs;
         *abp += (uint64_t)(ssbl->refs) * (ssbl->size + 1);
@@ -371,7 +405,7 @@ void compute_string_totals(uint64_t *asp, uint64_t *abp, uint64_t *bp) {
  * are printed to stdout and abort() is called.  Otherwise the error messages
  * are added to the outbuffer.
  */
-void check_string_stats(outbuffer_t *out) {
+void check_string_stats(outbuffer_t* out) {
   uint64_t overhead = blocks[TAG_SHARED_STRING & 0xff] * sizeof(block_t) +
                       blocks[TAG_MALLOC_STRING & 0xff] * sizeof(malloc_block_t);
   uint64_t const num = blocks[TAG_SHARED_STRING & 0xff] + blocks[TAG_MALLOC_STRING & 0xff];
@@ -453,18 +487,18 @@ void check_string_stats(outbuffer_t *out) {
 /* currently: 1 - debug, 2 - suppress leak checks */
 void check_all_blocks(int flag) {
   int i, j, hsh;
-  md_node_t *entry;
-  object_t *ob;
-  array_t *vec;
-  mapping_t *map;
-  buffer_t *buf;
-  funptr_t *fp;
-  mapping_node_t *node;
-  program_t *prog;
-  sentence_t *sent;
-  char *ptr;
-  block_t *ssbl;
-  malloc_block_t *msbl;
+  md_node_t* entry;
+  object_t* ob;
+  array_t* vec;
+  mapping_t* map;
+  buffer_t* buf;
+  funptr_t* fp;
+  mapping_node_t* node;
+  program_t* prog;
+  sentence_t* sent;
+  char* ptr;
+  block_t* ssbl;
+  malloc_block_t* msbl;
   extern svalue_t apply_ret_value;
 
   outbuf_zero(&out);
@@ -473,7 +507,7 @@ void check_all_blocks(int flag) {
   }
 
   for (hsh = 0; hsh < MD_TABLE_SIZE; hsh++) {
-    for (entry = table[hsh]; entry; entry = entry->next) {
+    for (entry = md_chain_decode(table[hsh]); entry; entry = md_chain_decode(entry->next)) {
       entry->tag &= ~TAG_MARKED;
       switch (entry->tag & 0xff00) {
         case TAG_TEMPORARY:
@@ -492,25 +526,25 @@ void check_all_blocks(int flag) {
       }
       switch (entry->tag) {
         case TAG_OBJECT:
-          ob = NODET_TO_PTR(entry, object_t *);
+          ob = NODET_TO_PTR(entry, object_t*);
           ob->extra_ref = 0;
           break;
         case TAG_PROGRAM:
-          prog = NODET_TO_PTR(entry, program_t *);
+          prog = NODET_TO_PTR(entry, program_t*);
           prog->extra_ref = 0;
           prog->extra_func_ref = 0;
           break;
         case TAG_MALLOC_STRING: {
-          char *str;
+          char* str;
 
-          msbl = NODET_TO_PTR(entry, malloc_block_t *);
+          msbl = NODET_TO_PTR(entry, malloc_block_t*);
           /* don't give an error for the return value we are
              constructing :) */
           if (msbl == MSTR_BLOCK(out.buffer)) {
             break;
           }
 
-          str = (char *)(msbl + 1);
+          str = (char*)(msbl + 1);
           msbl->extra_ref = 0;
           if (msbl->size != USHRT_MAX && msbl->size != strlen(str)) {
             outbuf_addv(&out,
@@ -521,28 +555,31 @@ void check_all_blocks(int flag) {
           break;
         }
         case TAG_SHARED_STRING:
-          ssbl = NODET_TO_PTR(entry, block_t *);
+          ssbl = NODET_TO_PTR(entry, block_t*);
           EXTRA_REF(ssbl) = 0;
           break;
         case TAG_ARRAY:
-          vec = NODET_TO_PTR(entry, array_t *);
+          vec = NODET_TO_PTR(entry, array_t*);
           vec->extra_ref = 0;
           break;
         case TAG_CLASS:
-          vec = NODET_TO_PTR(entry, array_t *);
+          vec = NODET_TO_PTR(entry, array_t*);
           vec->extra_ref = 0;
           break;
         case TAG_MAPPING:
-          map = NODET_TO_PTR(entry, mapping_t *);
+          map = NODET_TO_PTR(entry, mapping_t*);
           map->extra_ref = 0;
           break;
         case TAG_FUNP:
-          fp = NODET_TO_PTR(entry, funptr_t *);
+          fp = NODET_TO_PTR(entry, funptr_t*);
           fp->hdr.extra_ref = 0;
           break;
         case TAG_BUFFER:
-          buf = NODET_TO_PTR(entry, buffer_t *);
+          buf = NODET_TO_PTR(entry, buffer_t*);
           buf->extra_ref = 0;
+          break;
+        case TAG_PROMISE:
+          NODET_TO_PTR(entry, promise_t*)->extra_ref = 0;
           break;
       }
     }
@@ -634,14 +671,14 @@ void check_all_blocks(int flag) {
         DEBUG_CHECK(query_heart_beat(ob) == 0, "Driver BUG: object with heartbeat not in hb table");
       }
     }
-    for (ob = obj_list_destruct; ob; ob = ob->next_all) {
+    for (ob = obj_list_destruct; ob; ob = ob->next_destruct) {
       if ((ob->flags & O_HEART_BEAT) != 0) {
         DEBUG_CHECK(query_heart_beat(ob) == 0, "Driver BUG: object with heartbeat not in hb table");
       }
     }
 
     /* now do a mark and sweep check to see what should be alloc'd */
-    for (const auto &user : users()) {
+    for (const auto& user : users()) {
       DO_MARK(user, TAG_INTERACTIVE);
       user->ob->extra_ref++;
       // FIXME(sunyc): I can't explain this, appearently somewhere
@@ -667,12 +704,13 @@ void check_all_blocks(int flag) {
 #endif
     }
 
-    auto *dfm = CONFIG_STR(__DEFAULT_FAIL_MESSAGE__);
+    auto* dfm = CONFIG_STR(__DEFAULT_FAIL_MESSAGE__);
     if (dfm != nullptr && strlen(dfm) > 0) {
       char buf[8192];
-      strcpy(buf, dfm);
-      strcat(buf, "\n");
-      const char *target = findstring(buf);
+      // dfm is the admin-configured __DEFAULT_FAIL_MESSAGE__; bound the copy so
+      // an over-long message can't overflow this fixed buffer.
+      snprintf(buf, sizeof(buf), "%s\n", dfm);
+      const char* target = findstring(buf);
       if (target) {
         EXTRA_REF(BLOCK(target))++;
       }
@@ -697,6 +735,14 @@ void check_all_blocks(int flag) {
     mark_stack();
     mark_command_giver_stack();
     mark_call_outs();
+    mark_dns_requests();
+    mark_promise_queue();
+#ifdef PACKAGE_FFI
+    mark_ffi();
+#endif
+#ifdef PACKAGE_JSBRIDGE
+    mark_js_calls();
+#endif
     mark_simuls();
     mark_mapping_node_blocks();
     mark_config();
@@ -708,6 +754,9 @@ void check_all_blocks(int flag) {
 #endif
 #ifdef PACKAGE_ASYNC
     async_mark_request();
+#endif
+#ifdef PACKAGE_EXTERNAL
+    mark_external();
 #endif
     free_svalue(&apply_ret_value, "checkmemory");
     apply_ret_value = const0u;
@@ -722,26 +771,26 @@ void check_all_blocks(int flag) {
       ob->extra_ref++;
     }
     /* objects on obj_list_destruct still have a ref too */
-    for (ob = obj_list_destruct; ob; ob = ob->next_all) {
+    for (ob = obj_list_destruct; ob; ob = ob->next_destruct) {
       ob->extra_ref++;
     }
 
     for (hsh = 0; hsh < MD_TABLE_SIZE; hsh++) {
-      for (entry = table[hsh]; entry; entry = entry->next) {
+      for (entry = md_chain_decode(table[hsh]); entry; entry = md_chain_decode(entry->next)) {
         switch (entry->tag & ~TAG_MARKED) {
           case TAG_IDENT_TABLE: {
             ident_hash_elem_t *hptr, *first;
-            ident_hash_elem_t **table;
+            ident_hash_elem_t** table;
             int size;
 
-            table = NODET_TO_PTR(entry, ident_hash_elem_t **);
-            size = (entry->size / 3) / sizeof(ident_hash_elem_t *);
+            table = NODET_TO_PTR(entry, ident_hash_elem_t**);
+            size = (entry->size / 3) / sizeof(ident_hash_elem_t*);
             for (i = 0; i < size; i++) {
               first = table[i];
               if (first) {
                 hptr = first;
                 do {
-                  if (hptr->token & (IHE_SIMUL | IHE_EFUN)) {
+                  if (hptr->token & (IHE_SIMUL | IHE_EFUN | IHE_ORPHAN)) {
                     DO_MARK(hptr, TAG_PERM_IDENT);
                   }
                   hptr = hptr->next;
@@ -751,11 +800,14 @@ void check_all_blocks(int flag) {
             break;
           }
           case TAG_FUNP:
-            fp = NODET_TO_PTR(entry, funptr_t *);
+            fp = NODET_TO_PTR(entry, funptr_t*);
             mark_funp(fp);
             break;
+          case TAG_PROMISE:
+            mark_promise(NODET_TO_PTR(entry, promise_t*));
+            break;
           case TAG_ARRAY:
-            vec = NODET_TO_PTR(entry, array_t *);
+            vec = NODET_TO_PTR(entry, array_t*);
             if (entry->size != sizeof(array_t) + sizeof(svalue_t[1]) * (vec->size - 1)) {
               outbuf_addv(&out, "array size doesn't match block size: %s %04x\n", entry->desc,
                           entry->tag);
@@ -765,7 +817,7 @@ void check_all_blocks(int flag) {
             }
             break;
           case TAG_CLASS:
-            vec = NODET_TO_PTR(entry, array_t *);
+            vec = NODET_TO_PTR(entry, array_t*);
             if (vec->size &&
                 entry->size != sizeof(array_t) + sizeof(svalue_t[1]) * (vec->size - 1)) {
               outbuf_addv(&out, "class size doesn't match block size: %s %04x\n", entry->desc,
@@ -776,7 +828,7 @@ void check_all_blocks(int flag) {
             }
             break;
           case TAG_MAPPING:
-            map = NODET_TO_PTR(entry, mapping_t *);
+            map = NODET_TO_PTR(entry, mapping_t*);
             DO_MARK(map->table, TAG_MAP_TBL);
 
             i = map->table_size;
@@ -788,17 +840,17 @@ void check_all_blocks(int flag) {
             } while (i--);
             break;
           case TAG_OBJECT:
-            ob = NODET_TO_PTR(entry, object_t *);
+            ob = NODET_TO_PTR(entry, object_t*);
             mark_object(ob);
             {
-              object_t *tmp = obj_list;
+              object_t* tmp = obj_list;
               while (tmp && tmp != ob) {
                 tmp = tmp->next_all;
               }
               if (!tmp) {
                 tmp = obj_list_destruct;
                 while (tmp && tmp != ob) {
-                  tmp = tmp->next_all;
+                  tmp = tmp->next_destruct;
                 }
               }
 #ifdef DEBUG
@@ -814,13 +866,13 @@ void check_all_blocks(int flag) {
             }
             break;
           case TAG_LPC_OBJECT:
-            ob = NODET_TO_PTR(entry, object_t *);
+            ob = NODET_TO_PTR(entry, object_t*);
             if (ob->obname) {
               DO_MARK(ob->obname, TAG_OBJ_NAME);
             }
             break;
           case TAG_PROGRAM:
-            prog = NODET_TO_PTR(entry, program_t *);
+            prog = NODET_TO_PTR(entry, program_t*);
 
             if (prog->line_info) {
               DO_MARK(prog->file_info, TAG_LINENUMBERS);
@@ -850,14 +902,14 @@ void check_all_blocks(int flag) {
 
     /* now check */
     for (hsh = 0; hsh < MD_TABLE_SIZE; hsh++) {
-      for (entry = table[hsh]; entry; entry = entry->next) {
+      for (entry = md_chain_decode(table[hsh]); entry; entry = md_chain_decode(entry->next)) {
         switch (entry->tag) {
           case TAG_MUDLIB_STATS:
             outbuf_addv(&out, "WARNING: Found orphan mudlib stat block: %s %04x\n", entry->desc,
                         entry->tag);
             break;
           case TAG_PROGRAM:
-            prog = NODET_TO_PTR(entry, program_t *);
+            prog = NODET_TO_PTR(entry, program_t*);
             if (prog->ref != prog->extra_ref) {
               outbuf_addv(&out, "Bad ref count for program %s, is %d - should be %d\n",
                           prog->filename, prog->ref, prog->extra_ref);
@@ -870,14 +922,14 @@ void check_all_blocks(int flag) {
             }
             break;
           case TAG_OBJECT:
-            ob = NODET_TO_PTR(entry, object_t *);
+            ob = NODET_TO_PTR(entry, object_t*);
             if (ob->ref != ob->extra_ref) {
               outbuf_addv(&out, "Bad ref count for object %s, is %d - should be %d\n", ob->obname,
                           ob->ref, ob->extra_ref);
             }
             break;
           case TAG_ARRAY:
-            vec = NODET_TO_PTR(entry, array_t *);
+            vec = NODET_TO_PTR(entry, array_t*);
             if (vec->ref != vec->extra_ref) {
               outbuf_addv(&out, "Bad ref count for array, is %d - should be %d\n", vec->ref,
                           vec->extra_ref);
@@ -886,21 +938,21 @@ void check_all_blocks(int flag) {
             }
             break;
           case TAG_CLASS:
-            vec = NODET_TO_PTR(entry, array_t *);
+            vec = NODET_TO_PTR(entry, array_t*);
             if (vec->ref != vec->extra_ref) {
               outbuf_addv(&out, "Bad ref count for class, is %d - should be %d\n", vec->ref,
                           vec->extra_ref);
             }
             break;
           case TAG_MAPPING:
-            map = NODET_TO_PTR(entry, mapping_t *);
+            map = NODET_TO_PTR(entry, mapping_t*);
             if (map->ref != map->extra_ref) {
               outbuf_addv(&out, "Bad ref count for mapping, is %d - should be %d\n", map->ref,
                           map->extra_ref);
             }
             break;
           case TAG_FUNP:
-            fp = NODET_TO_PTR(entry, funptr_t *);
+            fp = NODET_TO_PTR(entry, funptr_t*);
             if (fp->hdr.owner && (strcmp(fp->hdr.owner->obname, "single/tests/efuns/async") == 0 ||
                                   strcmp(fp->hdr.owner->obname, "single/tests/efuns/db") == 0)) {
               // Async package mark doesn't work yet.
@@ -910,25 +962,31 @@ void check_all_blocks(int flag) {
               outbuf_addv(&out,
                           "Bad ref count for function pointer %p (type %d, owned by %s), "
                           "is %d - should be %d\n",
-                          fp,
-                          fp->hdr.type,
-                          (fp->hdr.owner ? fp->hdr.owner->obname : "(null)"), fp->hdr.ref,
-                          fp->hdr.extra_ref);
-              switch(fp->hdr.type) {
+                          fp, fp->hdr.type, (fp->hdr.owner ? fp->hdr.owner->obname : "(null)"),
+                          fp->hdr.ref, fp->hdr.extra_ref);
+              switch (fp->hdr.type) {
                 case FP_FUNCTIONAL:
                   outbuf_addv(&out, "fp offset %04x :\n", fp->f.functional.offset);
-                  dump_prog(fp->f.functional.prog, stdout, 1|2);
+                  dump_prog(fp->f.functional.prog, stdout, 1 | 2);
               }
               md_print_ref_journal(entry, &out);
             }
             break;
           case TAG_BUFFER:
-            buf = NODET_TO_PTR(entry, buffer_t *);
+            buf = NODET_TO_PTR(entry, buffer_t*);
             if (buf->ref != buf->extra_ref) {
               outbuf_addv(&out, "Bad ref count for buffer, is %d - should be %d\n", buf->ref,
                           buf->extra_ref);
             }
             break;
+          case TAG_PROMISE: {
+            promise_t* prom = NODET_TO_PTR(entry, promise_t*);
+            if (prom->ref != prom->extra_ref) {
+              outbuf_addv(&out, "Bad ref count for promise %p (state %d), is %d - should be %d\n",
+                          prom, prom->state, prom->ref, prom->extra_ref);
+            }
+            break;
+          }
           case TAG_PREDEFINES:
             outbuf_addv(&out, "WARNING: Found orphan predefine: %s %04x\n", entry->desc,
                         entry->tag);
@@ -941,6 +999,10 @@ void check_all_blocks(int flag) {
             outbuf_addv(&out, "WARNING: Found orphan object name: %s %04x\n", entry->desc,
                         entry->tag);
             break;
+          case TAG_OBJ_VARS:
+            outbuf_addv(&out, "WARNING: Found orphan object variable block: %s %04x\n",
+                        entry->desc, entry->tag);
+            break;
           case TAG_INTERACTIVE:
             outbuf_addv(&out, "WARNING: Found orphan interactive: %s %04x\n", entry->desc,
                         entry->tag);
@@ -952,7 +1014,7 @@ void check_all_blocks(int flag) {
           */
             break;
           case TAG_SENTENCE:
-            sent = NODET_TO_PTR(entry, sentence_t *);
+            sent = NODET_TO_PTR(entry, sentence_t*);
             outbuf_addv(&out, "WARNING: Found orphan sentence: %s:%s - %s %04x\n", sent->ob->obname,
                         sent->function.s, entry->desc, entry->tag);
             break;
@@ -961,12 +1023,12 @@ void check_all_blocks(int flag) {
                         entry->tag);
             break;
           case TAG_STRING:
-            ptr = NODET_TO_PTR(entry, char *);
+            ptr = NODET_TO_PTR(entry, char*);
             outbuf_addv(&out, "WARNING: Found orphan malloc'ed string: \"%s\" - %s %04x\n", ptr,
                         entry->desc, entry->tag);
             break;
           case TAG_MALLOC_STRING:
-            msbl = NODET_TO_PTR(entry, malloc_block_t *);
+            msbl = NODET_TO_PTR(entry, malloc_block_t*);
             /* don't give an error for the return value we are
                constructing :) */
             if (msbl == MSTR_BLOCK(out.buffer)) {
@@ -982,11 +1044,11 @@ void check_all_blocks(int flag) {
               outbuf_addv(&out,
                           "Bad ref count for malloc string \"%s\" %s %04x, is "
                           "%d - should be %d\n",
-                          (char *)(msbl + 1), entry->desc, entry->tag, msbl->ref, msbl->extra_ref);
+                          (char*)(msbl + 1), entry->desc, entry->tag, msbl->ref, msbl->extra_ref);
             }
             break;
           case TAG_SHARED_STRING:
-            ssbl = NODET_TO_PTR(entry, block_t *);
+            ssbl = NODET_TO_PTR(entry, block_t*);
             if (REFS(ssbl) != EXTRA_REF(ssbl)) {
               outbuf_addv(&out,
                           "Bad ref count for shared string \"%s\", is %d - "
@@ -1014,6 +1076,8 @@ void check_all_blocks(int flag) {
           case TAG_PERMANENT: /* only save_object|resotre_object uses this */
             break;
             /* FIXME: need to account these. */
+          case TAG_SCRATCHPAD: /* compile arena: retained across compiles by design */
+          case TAG_REPLACE_OB: /* pending until the backend's replace_programs() */
           case TAG_INC_LIST:
           case TAG_IDENT_TABLE:
           case TAG_OBJ_TBL:
@@ -1022,6 +1086,7 @@ void check_all_blocks(int flag) {
           case TAG_LOCALS:
           case TAG_CALL_OUT:
           case TAG_INPUT_TO:
+          case TAG_DEFERS: /* may be parked in a suspended async coroutine */
             break;
           default:
             if (entry->tag < TAG_MARKED) {
@@ -1040,7 +1105,8 @@ void check_all_blocks(int flag) {
     outbuf_add(&out, "------------------------------ ------ --------\n");
     for (i = 1; i < MAX_TAGS; i++) {
       if (totals[i]) {
-        outbuf_addv(&out, "%-30s %6" PRIu64 " %8" PRIu64 "\n", sources[i], blocks[i], totals[i]);
+        outbuf_addv(&out, "%-30s %6" PRIu64 " %8" PRIu64 "\n", source_name(i), blocks[i],
+                    totals[i]);
       }
       if (i == 5) {
         outbuf_add(&out, "\n");
@@ -1048,11 +1114,396 @@ void check_all_blocks(int flag) {
     }
   }
   if (!(flag & 2)) {
+    // A detached reference loop is invisible to the ref-count comparison
+    // above (a cycle is perfectly self-consistent), so hunt for it
+    // separately -- skippable via flag bit 2 (value 4) since it is a full
+    // extra pass over every compound block. Report only; collection is the
+    // mudlib's explicit call via find_orphaned_cycles(1).
+    if (!(flag & 4)) {
+      int orphans = md_scan_orphaned_cycles(0, &out);
+      if (orphans) {
+        outbuf_addv(&out,
+                    "WARNING: %d unreachable data block(s) kept alive only by "
+                    "reference loop(s); reclaim with find_orphaned_cycles(1)\n",
+                    orphans);
+      }
+    }
     outbuf_push(&out);
   } else {
     FREE_MSTR(out.buffer);
     push_number(0);
   }
+}
+
+/*
+ * Orphaned reference-loop detection and collection, via trial deletion
+ * (the same idea CPython's gc uses):
+ *
+ *   For every cycle-capable data block (array, class, mapping, funptr),
+ *   count how many of its references come from OTHER data blocks
+ *   ("internal"). external = ref - internal. A block with external > 0 is
+ *   held by something that is not plain data -- an object's variables, the
+ *   VM stack, a call_out, a C++-side holder -- and is therefore a live
+ *   root; liveness then propagates along data edges. Whatever remains is
+ *   reachable only from itself: garbage that pure reference counting can
+ *   never reclaim, which (in a finite graph) always contains at least one
+ *   reference loop.
+ *
+ * Because the verdict is computed from real ref counts, there is no root
+ * enumeration to get wrong: any holder that took a legitimate reference --
+ * including package internals invisible to the mark phase -- shows up as an
+ * external ref and keeps its data alive.
+ *
+ * Collection mirrors what free-ing the loop by hand would do, in an order
+ * that can never touch freed memory:
+ *   1. take a reference on every dead block (so nothing deallocates early),
+ *   2. sever: clear every dead block's child slots (releasing strings,
+ *      objects, buffers, and live values normally, and unlinking the dead
+ *      blocks from each other; a dead funptr just drops its args array),
+ *   3. release the held references -- each dead block is now at ref 1 and
+ *      deallocates cleanly with nothing left to cascade into.
+ */
+int md_scan_orphaned_cycles(int collect, outbuffer_t* ob) {
+  struct Cand {
+    int tag;
+    int internal = 0;
+    bool live = false;
+  };
+  std::unordered_map<void*, Cand> cands;
+  cands.reserve(blocks[TAG_ARRAY & 0xff] + blocks[TAG_CLASS & 0xff] +
+                blocks[TAG_MAPPING & 0xff] + blocks[TAG_FUNP & 0xff] +
+                blocks[TAG_PROMISE & 0xff]);
+
+  for (int hsh = 0; hsh < MD_TABLE_SIZE; hsh++) {
+    for (md_node_t* entry = md_chain_decode(table[hsh]); entry; entry = md_chain_decode(entry->next)) {
+      switch (entry->tag) {
+        case TAG_ARRAY:
+        case TAG_CLASS:
+          cands[NODET_TO_PTR(entry, void*)] = Cand{entry->tag};
+          break;
+        case TAG_MAPPING:
+          cands[NODET_TO_PTR(entry, void*)] = Cand{entry->tag};
+          break;
+        case TAG_FUNP:
+          cands[NODET_TO_PTR(entry, void*)] = Cand{entry->tag};
+          break;
+        case TAG_PROMISE:
+          cands[NODET_TO_PTR(entry, void*)] = Cand{entry->tag};
+          break;
+      }
+    }
+  }
+
+  auto ref_of = [](void* p, int tag) -> LPC_INT {
+    switch (tag) {
+      case TAG_ARRAY:
+      case TAG_CLASS:
+        return reinterpret_cast<array_t*>(p)->ref;
+      case TAG_MAPPING:
+        return reinterpret_cast<mapping_t*>(p)->ref;
+      case TAG_FUNP:
+        return reinterpret_cast<funptr_t*>(p)->hdr.ref;
+      case TAG_PROMISE:
+        return reinterpret_cast<promise_t*>(p)->ref;
+    }
+    return 0;
+  };
+
+  auto data_child = [](svalue_t* sv) -> void* {
+    switch (sv->type) {
+      case T_ARRAY:
+      case T_CLASS:
+        return reinterpret_cast<void*>(sv->u.arr);
+      case T_MAPPING:
+        return reinterpret_cast<void*>(sv->u.map);
+      case T_FUNCTION:
+        return reinterpret_cast<void*>(sv->u.fp);
+      case T_PROMISE:
+        return reinterpret_cast<void*>(sv->u.prom);
+    }
+    return nullptr;
+  };
+
+  // cb receives each data-block pointer this block holds a reference to.
+  // (Generic lambda so the per-element callback inlines -- this runs over
+  // every slot of every compound block in the heap, twice.)
+  // NOTE: this edge set (array/class items, mapping keys AND values,
+  // fp->hdr.args; objects are leaves) must stay in sync with the walker in
+  // src/packages/contrib/cycles.cc (cycle_walk), or has_cycle()/
+  // break_cycles() and this scan will disagree about what a loop is.
+  auto each_child = [&](void* p, int tag, auto&& cb) {
+    switch (tag) {
+      case TAG_ARRAY:
+      case TAG_CLASS: {
+        auto* arr = reinterpret_cast<array_t*>(p);
+        for (int i = 0; i < arr->size; i++) {
+          if (void* c = data_child(&arr->item[i])) {
+            cb(c);
+          }
+        }
+        break;
+      }
+      case TAG_MAPPING: {
+        auto* map = reinterpret_cast<mapping_t*>(p);
+        for (int i = 0; i <= static_cast<int>(map->table_size); i++) {
+          for (mapping_node_t* node = map->table[i]; node; node = node->next) {
+            if (void* c = data_child(&node->values[0])) {
+              cb(c);
+            }
+            if (void* c = data_child(&node->values[1])) {
+              cb(c);
+            }
+          }
+        }
+        break;
+      }
+      case TAG_FUNP: {
+        auto* fp = reinterpret_cast<funptr_t*>(p);
+        if (fp->hdr.args) {
+          cb(reinterpret_cast<void*>(fp->hdr.args));
+        }
+        break;
+      }
+      case TAG_PROMISE: {
+        // Same edge set as cycles.cc's T_PROMISE case: the settled value
+        // AND the pending reaction list. The reactions hold strong refs
+        // (handler funptrs and the chained promise), so a handler that
+        // captures the promise it is attached to closes a real loop --
+        // treating them as leaves made that leak undetectable.
+        auto* prom = reinterpret_cast<promise_t*>(p);
+        if (void* c = data_child(&prom->result)) {
+          cb(c);
+        }
+        if (prom->reactions) {
+          for (auto& r : *prom->reactions) {
+            if (r.on_fulfilled) {
+              cb(reinterpret_cast<void*>(r.on_fulfilled));
+            }
+            if (r.on_rejected) {
+              cb(reinterpret_cast<void*>(r.on_rejected));
+            }
+            if (r.next) {
+              cb(reinterpret_cast<void*>(r.next));
+            }
+            if (r.coro) {
+              // A PARKED COROUTINE is a reference holder too: its saved
+              // frame slice holds the awaited promise itself in the common
+              // `mixed p = promise_create(); await p;` shape, closing a
+              // loop that is otherwise invisible to every detector.
+              for (int fi = 0; fi < r.coro->frame_size; fi++) {
+                if (void* c = data_child(&r.coro->frame[fi])) {
+                  cb(c);
+                }
+              }
+              cb(reinterpret_cast<void*>(r.coro->result_promise));
+              for (struct defer_list* d = r.coro->defers; d; d = d->next) {
+                if (void* c = data_child(&d->func)) {
+                  cb(c);
+                }
+                if (void* c = data_child(&d->tp)) {
+                  cb(c);
+                }
+              }
+              // acatch-region defers captured at park time travel in the
+              // markers, not coro->defers (mark_coroutine/free_coroutine
+              // both walk them; this walker must agree)
+              for (auto& mk : r.coro->markers) {
+                for (struct defer_list* d = mk.defers; d; d = d->next) {
+                  if (void* c = data_child(&d->func)) {
+                    cb(c);
+                  }
+                  if (void* c = data_child(&d->tp)) {
+                    cb(c);
+                  }
+                }
+              }
+            }
+          }
+        }
+        break;
+      }
+    }
+  };
+
+  // internal = references held by other data blocks
+  for (auto& kv : cands) {
+    each_child(kv.first, kv.second.tag, [&](void* c) {
+      auto it = cands.find(c);
+      if (it != cands.end()) {
+        it->second.internal++;
+      }
+    });
+  }
+
+  // seeds: any block some non-data holder references (conservatively
+  // including anything whose counts look inconsistent), then propagate
+  std::vector<std::pair<void*, int>> work;  // (block, tag) -- avoids a re-lookup per pop
+  for (auto& kv : cands) {
+    if (ref_of(kv.first, kv.second.tag) != kv.second.internal) {
+      kv.second.live = true;
+      work.emplace_back(kv.first, kv.second.tag);
+    }
+  }
+  while (!work.empty()) {
+    auto [p, tag] = work.back();
+    work.pop_back();
+    each_child(p, tag, [&](void* c) {
+      auto it = cands.find(c);
+      if (it != cands.end() && !it->second.live) {
+        it->second.live = true;
+        work.emplace_back(c, it->second.tag);
+      }
+    });
+  }
+
+  int dead = 0, n_arr = 0, n_cls = 0, n_map = 0, n_fp = 0, n_prom = 0;
+  for (auto& kv : cands) {
+    if (!kv.second.live) {
+      dead++;
+      switch (kv.second.tag) {
+        case TAG_ARRAY:
+          n_arr++;
+          break;
+        case TAG_CLASS:
+          n_cls++;
+          break;
+        case TAG_MAPPING:
+          n_map++;
+          break;
+        case TAG_FUNP:
+          n_fp++;
+          break;
+        case TAG_PROMISE:
+          n_prom++;
+          break;
+      }
+    }
+  }
+  if (dead && ob) {
+    outbuf_addv(ob,
+                "orphaned by reference loops: %d array(s), %d class(es), %d mapping(s), %d "
+                "function pointer(s), %d promise(s)\n",
+                n_arr, n_cls, n_map, n_fp, n_prom);
+  }
+
+  if (dead && collect) {
+    // 1. hold
+    for (auto& kv : cands) {
+      if (kv.second.live) {
+        continue;
+      }
+      switch (kv.second.tag) {
+        case TAG_ARRAY:
+        case TAG_CLASS:
+          reinterpret_cast<array_t*>(kv.first)->ref++;
+          break;
+        case TAG_MAPPING:
+          reinterpret_cast<mapping_t*>(kv.first)->ref++;
+          break;
+        case TAG_FUNP:
+          reinterpret_cast<funptr_t*>(kv.first)->hdr.ref++;
+          break;
+        case TAG_PROMISE:
+          reinterpret_cast<promise_t*>(kv.first)->ref++;
+          break;
+      }
+    }
+    // 2. sever
+    for (auto& kv : cands) {
+      if (kv.second.live) {
+        continue;
+      }
+      switch (kv.second.tag) {
+        case TAG_ARRAY:
+        case TAG_CLASS: {
+          auto* arr = reinterpret_cast<array_t*>(kv.first);
+          for (int i = 0; i < arr->size; i++) {
+            free_svalue(&arr->item[i], "collect_cycles");
+            arr->item[i] = const0;
+          }
+          break;
+        }
+        case TAG_MAPPING: {
+          // The mapping is garbage; nobody can look anything up in it, so
+          // zeroing keys in place (hash invariants be damned) is fine --
+          // dealloc_mapping just walks the table.
+          auto* map = reinterpret_cast<mapping_t*>(kv.first);
+          for (int i = 0; i <= static_cast<int>(map->table_size); i++) {
+            for (mapping_node_t* node = map->table[i]; node; node = node->next) {
+              free_svalue(&node->values[0], "collect_cycles");
+              node->values[0] = const0;
+              free_svalue(&node->values[1], "collect_cycles");
+              node->values[1] = const0;
+            }
+          }
+          break;
+        }
+        case TAG_FUNP: {
+          auto* fp = reinterpret_cast<funptr_t*>(kv.first);
+          if (fp->hdr.args) {
+            free_array(fp->hdr.args);
+            fp->hdr.args = nullptr;
+          }
+          break;
+        }
+        case TAG_PROMISE: {
+          // Drop the settled value AND the pending reaction list: both hold
+          // strong refs and either can close a loop.
+          auto* prom = reinterpret_cast<promise_t*>(kv.first);
+          free_svalue(&prom->result, "collect_cycles");
+          prom->result = const0;
+          if (prom->reactions) {
+            for (auto& r : *prom->reactions) {
+              if (r.on_fulfilled) {
+                free_funp(r.on_fulfilled);
+                r.on_fulfilled = nullptr;
+              }
+              if (r.on_rejected) {
+                free_funp(r.on_rejected);
+                r.on_rejected = nullptr;
+              }
+              if (r.next) {
+                free_promise(r.next);
+                r.next = nullptr;
+              }
+              if (r.coro) {
+                // release the parked frame's refs as well; it can never
+                // run again once its promise is collected
+                free_coroutine_orphan(r.coro);
+                r.coro = nullptr;
+              }
+            }
+          }
+          break;
+        }
+      }
+    }
+    // 3. release
+    for (auto& kv : cands) {
+      if (kv.second.live) {
+        continue;
+      }
+      switch (kv.second.tag) {
+        case TAG_ARRAY:
+          free_array(reinterpret_cast<array_t*>(kv.first));
+          break;
+        case TAG_CLASS:
+          free_class(reinterpret_cast<array_t*>(kv.first));
+          break;
+        case TAG_MAPPING:
+          free_mapping(reinterpret_cast<mapping_t*>(kv.first));
+          break;
+        case TAG_FUNP:
+          free_funp(reinterpret_cast<funptr_t*>(kv.first));
+          break;
+        case TAG_PROMISE:
+          free_promise(reinterpret_cast<promise_t*>(kv.first));
+          break;
+      }
+    }
+  }
+
+  return dead;
 }
 
 #endif /* DEBUGMALLOC_EXTENSIONS */

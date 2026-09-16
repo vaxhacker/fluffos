@@ -1,5 +1,4 @@
 ---
-layout: doc
 title: internals / cache_stats
 ---
 # cache_stats
@@ -10,7 +9,7 @@ title: internals / cache_stats
 
 ### SYNOPSIS
 
-    void cache_stats( void );
+    string cache_stats();
 
 ### DESCRIPTION
 
@@ -20,5 +19,5 @@ title: internals / cache_stats
 
 ### SEE ALSO
 
-    opcprof(3), mud_status(3)
+    mud_status(3)
 

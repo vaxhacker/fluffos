@@ -6,11 +6,11 @@
  * Write statistics about objects on file.
  */
 
-static int sumSizes(mapping_t * /*m*/, mapping_node_t * /*elt*/, void * /*tp*/);
-static int svalue_size(svalue_t * /*v*/);
+static int sumSizes(mapping_t* /*m*/, mapping_node_t* /*elt*/, void* /*tp*/);
+static int svalue_size(svalue_t* /*v*/);
 
-static int sumSizes(mapping_t * /*m*/, mapping_node_t *elt, void *tp) {
-  int *t = reinterpret_cast<int *>(tp);
+static int sumSizes(mapping_t* /*m*/, mapping_node_t* elt, void* tp) {
+  int* t = reinterpret_cast<int*>(tp);
 
   *t += (svalue_size(&elt->values[0]) + svalue_size(&elt->values[1]));
   *t += sizeof(mapping_node_t);
@@ -19,7 +19,7 @@ static int sumSizes(mapping_t * /*m*/, mapping_node_t *elt, void *tp) {
 
 int depth = 0;
 
-static int svalue_size(svalue_t *v) {
+static int svalue_size(svalue_t* v) {
   int i, total;
 
   switch (v->type) {
@@ -86,6 +86,17 @@ static int svalue_size(svalue_t *v) {
     case T_BUFFER:
       /* first byte is stored inside the buffer struct */
       return sizeof(buffer_t) + v->u.buf->size - 1;
+    case T_PROMISE: {
+      if (++depth > 100) {
+        return 0;
+      }
+      total = sizeof(promise_t) + svalue_size(&v->u.prom->result);
+      if (v->u.prom->reactions) {
+        total += v->u.prom->reactions->size() * sizeof(promise_reaction_t);
+      }
+      depth--;
+      return total;
+    }
     default:
         // some freed value or a reference (!) to one (in all my test cases
         // anyway), it will be removed by reclaim_objects later, Wodan
@@ -96,7 +107,7 @@ static int svalue_size(svalue_t *v) {
   return 0;
 }
 
-int data_size(object_t *ob) {
+int data_size(object_t* ob) {
   int total = 0, i;
 
   if (ob->prog) {
@@ -108,10 +119,10 @@ int data_size(object_t *ob) {
   return total;
 }
 
-void dumpstat(const char *tfn) {
-  FILE *f;
-  object_t *ob;
-  const char *fn;
+void dumpstat(const char* tfn) {
+  FILE* f;
+  object_t* ob;
+  const char* fn;
 #ifdef F_SET_HIDE
   int display_hidden;
 #endif

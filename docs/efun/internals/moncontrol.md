@@ -1,5 +1,4 @@
 ---
-layout: doc
 title: internals / moncontrol
 ---
 # moncontrol
@@ -22,5 +21,5 @@ title: internals / moncontrol
 
 ### SEE ALSO
 
-    opcprof(3), function_profile(3)
+    function_profile(3)
 

@@ -25,8 +25,13 @@
 #define FRAME_EXTERNAL 8
 
 #define FRAME_RETURNED_FROM_CATCH 16
+/* async/await (issue #1319): on a FRAME_FUNCTION frame, marks the entry
+ * frame of an async coroutine body (pushed under run_async_function()); on a
+ * FRAME_CATCH frame, marks an acatch() region marker (no C++ recursion,
+ * unlike do_catch()). */
+#define FRAME_ASYNC 32
 struct defer_list {
-  struct defer_list *next;
+  struct defer_list* next;
   svalue_t func;
   svalue_t tp;
 };
@@ -36,15 +41,29 @@ struct control_stack_t {
 #endif
   union {
     long table_index;
-    funptr_t *funp;
+    funptr_t* funp;
   } fr;
-  object_t *ob;      /* Current object */
-  object_t *prev_ob; /* Save previous object */
-  program_t *prog;   /* Current program */
-  char *pc;          /* TODO: change this to unsigned char* */
+  object_t* ob;      /* Current object */
+  object_t* prev_ob; /* Save previous object */
+  program_t* prog;   /* Current program */
+  char* pc;          /* TODO: change this to unsigned char* */
 
-  svalue_t *fp;
-  struct defer_list *defers;
+  svalue_t* fp;
+  /* acatch() markers only (FRAME_CATCH | FRAME_ASYNC): the value-stack top
+   * and command-giver-stack top at region entry, so an unwind can cut both
+   * back to it the way restore_context() would. */
+  svalue_t* save_sp;
+  object_t** save_cgsp;
+#ifdef DEBUG
+  /* stack_in_use_as_temporary as it stood when this frame was pushed. An
+   * unwind cuts the value stack back to the frame, taking any foreach
+   * temporaries above it along, so the counter has to come back with them.
+   * Nothing else restores it -- error_context_t carries sp/csp/cgsp and not
+   * this -- and a NONZERO count silently disables break_point()'s stack
+   * check for all later LPC, so a leak here is permanent and quiet. */
+  int save_temporaries;
+#endif
+  struct defer_list* defers;
   int num_local_variables;   /* Local + arguments */
   int function_index_offset; /* Used when executing functions in inherited
                               * programs */
@@ -56,28 +75,41 @@ struct control_stack_t {
 };
 
 struct function_to_call_t {
-  object_t *ob;
+  object_t* ob;
   union {
-    funptr_t *fp;
-    const char *str;
+    funptr_t* fp;
+    const char* str;
   } f;
   int narg;
-  svalue_t *args;
+  svalue_t* args;
 };
 
 struct error_context_t {
-  struct control_stack_t *save_csp;
-  struct svalue_t *save_sp;
-  struct object_t **save_cgsp;
-  struct error_context_t *save_context;
+  struct control_stack_t* save_csp;
+  struct svalue_t* save_sp;
+  struct object_t** save_cgsp;
+  struct error_context_t* save_context;
 };
 
 struct function_lookup_info_t {
-  function_t *func;
+  function_t* func;
   int index;
 };
 
 #define IS_ZERO(x) (!(x) || (((x)->type == T_NUMBER) && ((x)->u.number == 0)))
+
+/* Did an LPC function the DRIVER called answer yes to a yes/no question?
+ *
+ * Not simply !IS_ZERO(): an async function hands back a T_PROMISE the instant
+ * its body parks, before it has decided anything, and a bare truthiness test
+ * reads that as "yes". A function that has not answered has not said yes --
+ * the same rule check_valid_path(), master_approved() and the command parser
+ * apply (AGENTS.md section 13.24). Use this wherever the driver asks an
+ * object a question and acts on the answer (id(), is_living(),
+ * inventory_accessible(), ...), NOT for an ordinary LPC callback whose result
+ * is used as a truth value -- there a promise is true, exactly as it is to
+ * the equivalent hand-written `if (cb(x))`. */
+#define APPLY_SAYS_YES(x) (!IS_ZERO(x) && (x)->type != T_PROMISE)
 #define IS_UNDEFINED(x) \
   (!(x) || (((x)->type == T_NUMBER) && ((x)->subtype == T_UNDEFINED) && ((x)->u.number == 0)))
 
@@ -96,11 +128,11 @@ struct function_lookup_info_t {
 #define put_buffer(x) SAFE(sp->type = T_BUFFER; sp->u.buf = (x);)
 #define put_undested_object(x) SAFE(sp->type = T_OBJECT; sp->u.ob = (x);)
 #define put_object(x) \
-  SAFE(if (!(x) || (x)->flags & O_DESTRUCTED) *sp = const0u; else put_undested_object(x);)
+  SAFE(if (!(x) || (x)->flags & O_DESTRUCTED)* sp = const0u; else put_undested_object(x);)
 #define put_unrefed_undested_object(x, y) \
   SAFE(sp->type = T_OBJECT; sp->u.ob = (x); add_ref((x), y);)
 #define put_unrefed_object(x, y)                             \
-  SAFE(if (!(x) || (x)->flags & O_DESTRUCTED) *sp = const0u; \
+  SAFE(if (!(x) || (x)->flags & O_DESTRUCTED)* sp = const0u; \
        else put_unrefed_undested_object(x, y);)
 /* see comments on push_constant_string */
 #define put_constant_string(x) \
@@ -111,98 +143,139 @@ struct function_lookup_info_t {
 #define put_shared_string(x) \
   SAFE(sp->type = T_STRING; sp->subtype = STRING_SHARED; sp->u.string = (x);)
 
-extern program_t *current_prog;
+extern program_t* current_prog;
 extern short caller_type;
-extern char *pc;
-extern svalue_t *sp;
-extern svalue_t *fp;
-extern svalue_t *const end_of_stack;
+extern char* pc;
+extern svalue_t* sp;
+extern svalue_t* fp;
+extern svalue_t* const end_of_stack;
 extern svalue_t catch_value;
-extern control_stack_t *const control_stack;
-extern control_stack_t *csp;
+extern control_stack_t* const control_stack;
+extern control_stack_t* csp;
 extern int too_deep_error;
 extern int max_eval_error;
 extern int function_index_offset;
 extern int variable_index_offset;
 extern int simul_efun_is_loading;
 extern program_t fake_prog;
-extern svalue_t global_lvalue_byte;
 extern int num_varargs;
 extern int st_num_arg;
 
-extern ref_t *global_ref_list;
+extern ref_t* global_ref_list;
 extern int lv_owner_type;
-extern refed_t *lv_owner;
-extern const char *lv_owner_str;
+extern refed_t* lv_owner;
+extern const char* lv_owner_str;
 
-void kill_ref(ref_t *);
-ref_t *make_ref(void);
+void kill_ref(ref_t*);
+ref_t* make_ref(void);
 
-void call_direct(object_t *, int, int, int);
-void eval_instruction(char *p);
+/* += / -= on a T_LVALUE_CODEPOINT slot; returns the resulting codepoint. */
+LPC_INT codepoint_lvalue_add(svalue_t* lval, LPC_INT delta);
 
-function_t *setup_inherited_frame(int);
-const char *function_name(program_t *, int);
-void remove_object_from_stack(object_t *);
-void setup_fake_frame(funptr_t *);
+/* Owns a popped (or stolen) stack lvalue. error() unwinds via a C++
+ * exception (do_catch / safe_apply), so the destructor releases the box
+ * on that path too -- a bare `svalue_t lvslot = *sp--` leaked every
+ * T_LVALUE_CODEPOINT / T_LVALUE_RANGE that hit error() before the
+ * matching free_svalue (issue #1358). */
+class PoppedLvalue {
+ public:
+  enum Mode { Pop, Steal };
+
+  explicit PoppedLvalue(Mode mode = Pop) {
+    slot_ = *sp;
+    if (mode == Pop) {
+      sp--;
+    } else {
+      /* Leave the stack slot but drop its claim on the box so unwind
+       * and this destructor cannot both delete it. */
+      sp->type = T_NUMBER;
+      sp->subtype = 0;
+      sp->u.number = 0;
+    }
+  }
+  ~PoppedLvalue() { free_svalue(&slot_, "PoppedLvalue"); }
+  PoppedLvalue(const PoppedLvalue&) = delete;
+  PoppedLvalue& operator=(const PoppedLvalue&) = delete;
+  svalue_t* target() { return lvalue_target(&slot_); }
+
+ private:
+  svalue_t slot_;
+};
+
+/* Convert a string (raw UTF-8 bytes) or array of ints 0..255 into a fresh
+ * buffer; errors on anything else. Caller owns the result. */
+buffer_t* svalue_to_buffer_bytes(svalue_t* from);
+
+void call_direct(object_t*, int, int, int);
+std::pair<program_t*, int> get_function_at_index(program_t* prog, int findex);
+// Pad varargs callees + evaluate default-argument helper closures (caller
+// context) before a direct call; returns the new argument count. See
+// interpret.cc for the paths that share it.
+int fill_default_args(program_t* progp, function_t* funcp, int funflags, int num_arg);
+void eval_instruction(char* p);
+
+function_t* setup_inherited_frame(int);
+const char* function_name(program_t*, int);
+void remove_object_from_stack(object_t*);
+void setup_fake_frame(funptr_t*);
 void remove_fake_frame(void);
 void push_indexed_lvalue(int);
 void setup_variables(int, int, int);
 
-void process_efun_callback(int, function_to_call_t *, int);
-svalue_t *call_efun_callback(function_to_call_t *, int);
-svalue_t *safe_call_efun_callback(function_to_call_t *, int);
-const char *type_name(int c);
+void process_efun_callback(int, function_to_call_t*, int);
+svalue_t* call_efun_callback(function_to_call_t*, int);
+svalue_t* safe_call_efun_callback(function_to_call_t*, int);
+const char* type_name(int c);
 [[noreturn]] void bad_arg(int, int);
-[[noreturn]] void bad_argument(svalue_t *, int, int, int);
-void check_for_destr(array_t *);
-int is_static(const char *, object_t *);
-svalue_t *call_function_pointer(funptr_t *, int);
-svalue_t *safe_call_function_pointer(funptr_t *, int);
-void call___INIT(object_t *);
-array_t *call_all_other(array_t *, const char *, int);
-const char *function_exists(const char *, object_t *, int);
+[[noreturn]] void bad_argument(svalue_t*, int, int, int);
+void check_for_destr(array_t*);
+int is_static(const char*, object_t*);
+svalue_t* call_function_pointer(funptr_t*, int);
+svalue_t* safe_call_function_pointer(funptr_t*, int);
+void call___INIT(object_t*);
+array_t* call_all_other(array_t*, const char*, int);
+const char* function_exists(const char*, object_t*, int);
 void mark_apply_low_cache(void);
-void translate_absolute_line(int, unsigned short *, int *, int *);
-char *add_slash(const char *const);
-int strpref(const char *, const char *);
-void do_trace(const char *, const char *, const char *);
-void opcdump(const char *);
-int inter_sscanf(svalue_t *, svalue_t *, svalue_t *, int);
-char *get_line_number_if_any(void);
-char *get_line_number(char *, const program_t *);
-void get_line_number_info(const char **, int *);
+void translate_absolute_line(int, lpc_file_info_t*, int*, int*, lpc_file_info_t* end = nullptr);
+char* add_slash(const char* const);
+int strpref(const char*, const char*);
+void do_trace(const char*, const char*, const char*);
+void opcdump(const char*);
+int inter_sscanf(svalue_t*, svalue_t*, svalue_t*, int);
+char* get_line_number_if_any(void);
+char* get_line_number(char*, const program_t*);
+void get_line_number_info(const char**, int*);
 void reset_machine(int);
-void unlink_string_svalue(svalue_t *);
-void copy_lvalue_range(svalue_t *);
-void assign_lvalue_range(svalue_t *);
-void debug_perror(const char *, const char *);
+void unlink_string_svalue(svalue_t*);
+void copy_lvalue_range(svalue_t* lval, svalue_t* from);
+void assign_lvalue_range(svalue_t* lval, svalue_t* from);
+void debug_perror(const char*, const char*);
 
 #ifndef NO_SHADOWS
-int validate_shadowing(object_t *);
+int validate_shadowing(object_t*);
 #endif
 
-void try_reset(object_t *);
+void try_reset(object_t*);
 
-void pop_context(error_context_t *);
-void restore_context(error_context_t *);
-void save_context(error_context_t *);
+void pop_context(error_context_t*);
+void restore_context(error_context_t*);
+void save_context(error_context_t*);
 
 void pop_control_stack(void);
-function_t *setup_new_frame(int);
+function_t* setup_new_frame(int);
 void push_control_stack(int);
 
 void break_point(void);
 
 #ifdef DEBUGMALLOC_EXTENSIONS
-void mark_svalue(svalue_t *);
+void mark_svalue(svalue_t*);
 void mark_stack(void);
 #endif
 
 // TODO: move these to correct places
 void setup_varargs_variables(int, int, int);
 
-inline const char *access_to_name(int mode) {
+inline const char* access_to_name(int mode) {
   switch (mode) {
     case DECL_HIDDEN:
       return "hidden";
@@ -221,7 +294,7 @@ inline const char *access_to_name(int mode) {
   }
 }
 
-void get_explicit_line_number_info(char *, const program_t *, const char **, int *);
+void get_explicit_line_number_info(char*, const program_t*, const char**, int*);
 int last_instructions();
 
 void push_undefineds(int num);

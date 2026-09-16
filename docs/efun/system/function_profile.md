@@ -1,5 +1,4 @@
 ---
-layout: doc
 title: system / function_profile
 ---
 # function_profile
@@ -10,7 +9,7 @@ title: system / function_profile
 
 ### SYNOPSIS
 
-    mixed *function_profile( object ob );
+    mapping *function_profile( object ob );
 
 ### DESCRIPTION
 
@@ -35,5 +34,5 @@ title: system / function_profile
 
 ### SEE ALSO
 
-    rusage(3), time_expression(3), opcprof(3)
+    rusage(3), time_expression(3)
 

@@ -6,14 +6,14 @@
 
 #define MAX_VERB_BUFF 100
 
-object_t **hashed_living = nullptr;
+object_t** hashed_living = nullptr;
 
 static int num_living_names;
 static int num_searches = 1;
 static int search_length = 1;
 static int illegal_sentence_action;
-static const char *last_verb;
-static object_t *illegal_sentence_ob;
+static const char* last_verb;
+static object_t* illegal_sentence_ob;
 
 void init_living() {
   // make sure size is power of 2.
@@ -24,14 +24,14 @@ void init_living() {
     CONFIG_INT(__LIVING_HASH_TABLE_SIZE__) = new_size;
   }
 
-  hashed_living = reinterpret_cast<object_t **>(DCALLOC(CONFIG_INT(__LIVING_HASH_TABLE_SIZE__),
-                                                        sizeof(object_t *), TAG_PERMANENT,
-                                                        __CURRENT_FILE_LINE__));
+  hashed_living = reinterpret_cast<object_t**>(DCALLOC(CONFIG_INT(__LIVING_HASH_TABLE_SIZE__),
+                                                       sizeof(object_t*), TAG_PERMANENT,
+                                                       __CURRENT_FILE_LINE__));
 }
 
 static void notify_no_command() {
   union string_or_func p;
-  svalue_t *v;
+  svalue_t* v;
 
   if (!command_giver || !command_giver->interactive) {
     return;
@@ -55,15 +55,15 @@ static void notify_no_command() {
       free_string(p.s);
       command_giver->interactive->default_err_message.s = nullptr;
     } else {
-      auto *dfm = CONFIG_STR(__DEFAULT_FAIL_MESSAGE__);
+      auto* dfm = CONFIG_STR(__DEFAULT_FAIL_MESSAGE__);
       tell_object(command_giver, dfm, strlen(dfm));
     }
   }
 }
 
-void clear_notify(object_t *ob) {
+void clear_notify(object_t* ob) {
   union string_or_func dem;
-  interactive_t *ip = ob->interactive;
+  interactive_t* ip = ob->interactive;
 
   dem = ip->default_err_message;
   if (ip->iflags & NOTIFY_FAIL_FUNC) {
@@ -75,13 +75,14 @@ void clear_notify(object_t *ob) {
   ip->default_err_message.s = nullptr;
 }
 
-static int hash_living_name(const char *str) {
-  return whashstr(str) & (CONFIG_INT(__LIVING_HASH_TABLE_SIZE__) - 1);
+static int hash_living_name(const char* str) {
+  return std::hash<std::string_view>{}(std::string_view(str)) &
+         (CONFIG_INT(__LIVING_HASH_TABLE_SIZE__) - 1);
 }
 
-object_t *find_living_object(const char *str, int user) {
+object_t* find_living_object(const char* str, int user) {
   object_t **obp, *tmp;
-  object_t **hl;
+  object_t** hl;
 
   if (!str) {
     return nullptr;
@@ -121,8 +122,8 @@ object_t *find_living_object(const char *str, int user) {
   return tmp;
 }
 
-void remove_living_name(object_t *ob) {
-  object_t **hl;
+void remove_living_name(object_t* ob) {
+  object_t** hl;
 
   ob->flags &= ~O_ENABLE_COMMANDS;
   if (!ob->living_name) {
@@ -146,9 +147,9 @@ void remove_living_name(object_t *ob) {
   ob->living_name = nullptr;
 }
 
-static void set_living_name(object_t *ob, const char *str) {
+static void set_living_name(object_t* ob, const char* str) {
   int const flags = ob->flags & O_ENABLE_COMMANDS;
-  object_t **hl;
+  object_t** hl;
 
   if (ob->flags & O_DESTRUCTED) {
     return;
@@ -162,14 +163,14 @@ static void set_living_name(object_t *ob, const char *str) {
   ob->flags |= flags;
 }
 
-void stat_living_objects(outbuffer_t *out) {
+void stat_living_objects(outbuffer_t* out) {
   outbuf_add(out, "Hash table of living objects:\n");
   outbuf_add(out, "-----------------------------\n");
   outbuf_addv(out, "%d living named objects, average search length: %4.2f\n\n", num_living_names,
               static_cast<double>(search_length) / num_searches);
 }
 
-void setup_new_commands(object_t *dest, object_t *item) {
+void setup_new_commands(object_t* dest, object_t* item) {
   object_t *next_ob, *ob;
 
   /*
@@ -274,7 +275,7 @@ static void enable_commands(int enable, int toggle_action) {
       if (current_object->super) {
         setup_new_commands(current_object->super, current_object);
       }
-      for (object_t *pp = current_object->contains; pp; pp = pp->next_inv) {
+      for (object_t* pp = current_object->contains; pp; pp = pp->next_inv) {
         setup_new_commands(current_object, pp);
       }
     }
@@ -286,11 +287,11 @@ static void enable_commands(int enable, int toggle_action) {
     /* Remove all sentences defined for the object */
     if (current_object->super) {
       remove_sent(current_object->super, current_object);
-      for (object_t *pp = current_object->super->contains; pp; pp = pp->next_inv) {
+      for (object_t* pp = current_object->super->contains; pp; pp = pp->next_inv) {
         remove_sent(pp, current_object);
       }
     }
-    for (object_t *pp = current_object->contains; pp; pp = pp->next_inv) {
+    for (object_t* pp = current_object->contains; pp; pp = pp->next_inv) {
       remove_sent(pp, current_object);
     }
 #endif
@@ -306,12 +307,12 @@ static void enable_commands(int enable, int toggle_action) {
  * Return success status.
  */
 
-static int user_parser(char *buff) {
+static int user_parser(char* buff) {
   char verb_buff[MAX_VERB_BUFF];
-  sentence_t *s;
-  char *p;
+  sentence_t* s;
+  char* p;
   int length;
-  const char *user_verb = nullptr;
+  const char* user_verb = nullptr;
   int where;
   int save_illegal_sentence_action;
 
@@ -345,7 +346,7 @@ static int user_parser(char *buff) {
    * copy user_verb into a static character buffer to be pointed to by
    * last_verb.
    */
-  u8_strncpy(reinterpret_cast<uint8_t *>(verb_buff), reinterpret_cast<const uint8_t *>(user_verb),
+  u8_strncpy(reinterpret_cast<uint8_t*>(verb_buff), reinterpret_cast<const uint8_t*>(user_verb),
              sizeof(verb_buff) - 1);
   verb_buff[sizeof(verb_buff) - 1] = '\0';
 
@@ -361,7 +362,7 @@ static int user_parser(char *buff) {
   save_illegal_sentence_action = illegal_sentence_action;
   illegal_sentence_action = 0;
   for (s = command_giver->sent; s; s = s->next) {
-    svalue_t *ret;
+    svalue_t* ret;
 
     if (s->flags & (V_NOSPACE | V_SHORT)) {
       if (strncmp(buff, s->verb, strlen(s->verb)) != 0) {
@@ -434,16 +435,40 @@ static int user_parser(char *buff) {
          it moved somewhere or dested itself */
       if (s == command_giver->sent) {
         char buf[256];
+        // s->verb is an arbitrary-length shared string; bound the format so a
+        // long verb cannot overflow buf (the result is only shown via error).
         if (s->flags & V_FUNCTION) {
-          sprintf(buf, "Verb '%s' bound to uncallable function pointer.\n", s->verb);
-          error(buf);
+          snprintf(buf, sizeof(buf), "Verb '%s' bound to uncallable function pointer.\n", s->verb);
+          error("%s", buf);
         } else {
-          sprintf(buf, "Function for verb '%s' not found.\n", s->verb);
-          error(buf);
+          snprintf(buf, sizeof(buf), "Function for verb '%s' not found.\n", s->verb);
+          error("%s", buf);
         }
       }
     }
 
+    /* An async verb function hands back a promise the instant its body parks,
+     * before it has decided whether it wants this command. The test below
+     * treats any non-zero, non-number return as "handled", so a promise used
+     * to consume the command: the verb's real answer was discarded, the
+     * remaining sentences on the verb were never tried, and
+     * notify_no_command() never fired.
+     *
+     * A verb that has not answered has not claimed the command, so this is
+     * NOT handled -- the same rule check_valid_path() applies to an async
+     * valid_read(). The compile-time refusal of `async` on applies cannot
+     * reach here: verb names are arbitrary runtime strings, and
+     * add_action((: f :), "verb") has no name at all. */
+    if (ret && ret->type == T_PROMISE) {
+      /* verb_buff, not s->verb: the sentence may be dangling here (the
+       * comment above the not-found check says so), and this branch has no
+       * `s == command_giver->sent` guard to lean on. */
+      debug_message(
+          "Verb '%s' returned a promise: a verb function cannot be async -- the driver needs "
+          "its answer now. Treating the command as unhandled.\n",
+          verb_buff);
+      ret = nullptr;
+    }
     if (ret && (ret->type != T_NUMBER || ret->u.number != 0)) {
 #ifdef PACKAGE_MUDLIB_STATS
       if (command_giver && command_giver->interactive
@@ -482,13 +507,13 @@ static int user_parser(char *buff) {
   return 0;
 }
 
-void safe_parse_command(char *str, object_t *ob) {
+void safe_parse_command(char* str, object_t* ob) {
   error_context_t econ;
   save_context(&econ);
 
   try {
     parse_command(str, ob);
-  } catch (const char *) {
+  } catch (const char*) {
     restore_context(&econ);
   }
   pop_context(&econ);
@@ -499,12 +524,12 @@ void safe_parse_command(char *str, object_t *ob) {
  * The command can also come from a NPC.
  * Beware that 'str' can be modified and extended !
  */
-int parse_command(char *str, object_t *ob) {
+int parse_command(char* str, object_t* ob) {
   int res;
 
   /* disallow users to issue commands containing ansi escape codes */
   if (CONFIG_INT(__RC_NO_ANSI__) && !CONFIG_INT(__RC_STRIP_BEFORE_PROCESS_INPUT__)) {
-    char *c;
+    char* c;
 
     for (c = str; *c; c++) {
       if (*c == 27) {
@@ -532,9 +557,9 @@ int parse_command(char *str, object_t *ob) {
  * If the call is from a shadow, make it look like it is really from
  * the shadowed object.
  */
-static void add_action(svalue_t *str, const char *cmd, int flag) {
-  sentence_t *p;
-  object_t *ob;
+static void add_action(svalue_t* str, const char* cmd, int flag) {
+  sentence_t* p;
+  object_t* ob;
 
   if (current_object->flags & O_DESTRUCTED) {
     return;
@@ -585,9 +610,9 @@ static void add_action(svalue_t *str, const char *cmd, int flag) {
  * if success.  If command_giver, remove his action, otherwise
  * remove current_object's action.
  */
-static int remove_action(const char *act, const char *verb) {
-  object_t *ob;
-  sentence_t **s;
+static int remove_action(svalue_t* act, const char* verb) {
+  object_t* ob;
+  sentence_t** s;
 
   if (command_giver) {
     ob = command_giver;
@@ -597,11 +622,19 @@ static int remove_action(const char *act, const char *verb) {
 
   if (ob) {
     for (s = &ob->sent; *s; s = &((*s)->next)) {
-      sentence_t *tmp;
+      sentence_t* tmp = *s;
+      int match;
 
-      if (((*s)->ob == current_object) && (!((*s)->flags & V_FUNCTION)) &&
-          !strcmp((*s)->function.s, act) && !strcmp((*s)->verb, verb)) {
-        tmp = *s;
+      if (tmp->ob != current_object || strcmp(tmp->verb, verb)) {
+        continue;
+      }
+      if (act->type == T_STRING) {
+        match = !(tmp->flags & V_FUNCTION) && !strcmp(tmp->function.s, act->u.string);
+      } else {
+        /* actions added as function pointers match by identity (issue #992) */
+        match = (tmp->flags & V_FUNCTION) && tmp->function.f == act->u.fp;
+      }
+      if (match) {
         *s = tmp->next;
         free_sentence(tmp);
         illegal_sentence_action = 1;
@@ -618,15 +651,19 @@ static int remove_action(const char *act, const char *verb) {
  * 'user'
  */
 #ifndef NO_ENVIRONMENT
-void remove_sent(object_t *ob, object_t *user) {
-  sentence_t **s;
+void remove_sent(object_t* ob, object_t* user) {
+  sentence_t** s;
 
-  if (!(user->flags & O_ENABLE_COMMANDS)) {
+  /* Gate on the list, not on O_ENABLE_COMMANDS: sentences can outlive the
+   * flag (disable_commands does not clear user->sent, and command() makes
+   * any object a command giver), and skipping them here left sentences
+   * whose s->ob dangled after the defining object was destructed. */
+  if (!user->sent) {
     return;
   }
 
   for (s = &user->sent; *s;) {
-    sentence_t *tmp;
+    sentence_t* tmp;
 
     if ((*s)->ob == ob) {
 #ifdef DEBUG
@@ -660,7 +697,7 @@ void f_add_action() {
 
   if (sp->type == T_ARRAY) {
     int i, n = sp->u.arr->size;
-    svalue_t *sv = sp->u.arr->item;
+    svalue_t* sv = sp->u.arr->item;
 
     for (i = 0; i < n; i++) {
       if (sv[i].type == T_STRING) {
@@ -731,7 +768,7 @@ void f_enable_commands() {
 
 #ifdef F_FIND_LIVING
 void f_find_living() {
-  object_t *ob;
+  object_t* ob;
 
   ob = find_living_object(sp->u.string, 0);
   free_string_svalue(sp);
@@ -746,7 +783,7 @@ void f_find_living() {
 
 #ifdef F_FIND_PLAYER
 void f_find_player() {
-  object_t *ob;
+  object_t* ob;
 
   ob = find_living_object(sp->u.string, 1);
   free_string_svalue(sp);
@@ -805,9 +842,9 @@ void f_query_verb() {
 void f_remove_action() {
   LPC_INT success;
 
-  success = remove_action((sp - 1)->u.string, sp->u.string);
+  success = remove_action(sp - 1, sp->u.string);
   free_string_svalue(sp--);
-  free_string_svalue(sp);
+  free_svalue(sp, "f_remove_action");
   put_number(success);
 }
 #endif

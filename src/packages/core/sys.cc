@@ -1,10 +1,13 @@
 #include "base/package_api.h"
 
 #include "net/tls.h"
+#ifdef F_SYS_RELOAD_TLS
+#include "net/websocket.h"
+#endif
 
 #ifdef F_SYS_NETWORK_PORTS
 void f_sys_network_ports() {
-  array_t *info;
+  array_t* info;
   int i = 0, p = 0;
 
   for (i = 0; i < 5; i++) {
@@ -20,7 +23,7 @@ void f_sys_network_ports() {
     if (!external_port[i].port) {
       continue;
     }
-    array_t *pInfo = allocate_empty_array(4);
+    array_t* pInfo = allocate_empty_array(4);
 
     pInfo->item[0].type = T_NUMBER;
     pInfo->item[0].subtype = 0;
@@ -54,28 +57,43 @@ void f_sys_reload_tls() {
   auto port_index = port_index_display - 1;
 
   DEFER { pop_stack(); };
-  if (port_index < 0 || port_index > sizeof(external_port)) {
-    error("Invalid port index: %d\n", port_index_display);
+  // external_port is a fixed array; bound by ELEMENT COUNT, not sizeof (which
+  // is the size in bytes and let indices up to ~sizeof(port_def_t)*N through,
+  // for an out-of-bounds read and a wild tls_server_close()/port->ssl write).
+  if (port_index < 0 ||
+      port_index >= (LPC_INT)(sizeof(external_port) / sizeof(external_port[0]))) {
+    error("Invalid port index: %" LPC_INT_FMTSTR_P "\n", port_index_display);
   }
-  auto *port = &external_port[port_index];
+  auto* port = &external_port[port_index];
   if (port->kind == PORT_TYPE_UNDEFINED) {
-    error("Invalid port index: %d\n", port_index_display);
+    error("Invalid port index: %" LPC_INT_FMTSTR_P "\n", port_index_display);
   }
+  int rc = 0;
   if (port->kind == PORT_TYPE_WEBSOCKET) {
-    error("Reloading websocket TLS config is not supported for port %d.\n", port->port);
+    // Same semantics as the telnet path: new connections pick up the
+    // cert/key currently on disk; existing sessions keep the handshake
+    // they already completed. Implemented by adding a new lws vhost
+    // (mutating the boot CTX in place does not change what clients see).
+    rc = reload_websocket_tls(port);
+  } else if (port->ssl == nullptr) {
+    rc = 1;
   } else {
-    if (port->ssl == nullptr) {
-      error("Port %d is not TLS enabled\n", port_index_display);
-    }
-    auto *ctx = tls_server_init(port->tls_cert, port->tls_key);
+    auto* ctx = tls_server_init(port->tls_cert, port->tls_key);
     if (ctx == nullptr) {
-      error("Failed to reload TLS context for port %d\n", port->port);
+      rc = 2;
+    } else {
+      // no race condition here since connection listener operates on main
+      // thread(), as all EFUNs do
+      tls_server_close(port->ssl);
+      port->ssl = ctx;
     }
-    // no race condition here since connection listener operates on main thread(), as all EFUNs do
-    auto *old_ctx = port->ssl;
-    tls_server_close(old_ctx);
-    port->ssl = ctx;
-    debug_message("Reloading TLS config for port %d.\n", port->port);
   }
+  if (rc == 1) {
+    error("Port %" LPC_INT_FMTSTR_P " is not TLS enabled\n", port_index_display);
+  }
+  if (rc == 2) {
+    error("Failed to reload TLS context for port %d\n", port->port);
+  }
+  debug_message("Reloading TLS config for port %d.\n", port->port);
 }
 #endif

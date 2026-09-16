@@ -1,0 +1,132 @@
+// file:   /inherit/master/valid.c
+// mudlib: Lil
+
+// separated out from master.c to reduce the complexity a bit.
+
+#include <globals.h>
+
+int inherit_called = 0;
+int get_inherit_called() {
+  return inherit_called;
+}
+
+void create() {}
+
+int valid_shadow(object ob) {
+#ifdef __PACKAGE_UIDS__
+  if (getuid(ob) == ROOT_UID) {
+    return 1; /* for test */
+  }
+#endif
+  if (ob->query_prevent_shadow(previous_object())) {
+    return 0;
+  }
+  return 1;
+}
+
+int valid_author(string) {
+  return 1;
+}
+
+// valid_override: controls which simul_efuns may be overridden with
+// efun:: prefix and which may not.  This function is only called at
+// object compile-time.
+//
+// The last (file, name, mainfile) triple the driver applied is recorded
+// so tests can assert on the exact arguments the compiler builds --
+// /single/tests/compiler/valid_override_file.lpc pins `file` as the
+// leading-slash, extension-less object name for every source extension.
+//
+// returns: 1 if override is allowed, 0 if not.
+
+nosave mixed *last_valid_override = 0;
+
+mixed *query_last_valid_override() {
+  return last_valid_override;
+}
+
+void clear_last_valid_override() {
+  last_valid_override = 0;
+}
+
+int valid_override(string file, string name, string mainfile) {
+  last_valid_override = ({ file, name, mainfile });
+  if (file == OVERRIDES_FILE) {
+    return 1;
+  }
+  if ((name == "move_object") && (file != BASE))
+    return 0;
+  //  may also wish to protect destruct, shutdown, snoop, and exec.
+  return 1;
+}
+
+// valid_seteuid: determines whether an object ob can become euid str.
+// returns: 1 if seteuid() may succeed, 0 if not.
+
+int valid_seteuid(object, string) {
+  return 1;
+}
+
+// valid_domain: decides if a domain may be created
+// returns: 1 if domain may be created, 0 if not.
+
+int valid_domain(string) {
+  return 1;
+}
+
+// valid_socket: controls access to socket efunctions
+// return: 1 if access allowed, 0 if not.
+
+int valid_socket(object, string, mixed *) {
+  return 1;
+}
+
+// Write and Read privileges:
+//
+// valid_write: called with the file name, the object initiating the call,
+//  and the function by which they called it.
+// return: 1 if access allowed, 0 if access not allowed.
+
+// valid_read/valid_write deliberately end by calling efuns of differing
+// arities: st_num_arg is a bare global overwritten by every efun dispatch,
+// so an efun that consults it AFTER this apply returns (e.g. to detect an
+// optional trailing argument) reads the arity of whatever we called last.
+// With these calls in place, every file efun exercised by the suite runs
+// its post-apply logic against a clobbered st_num_arg -- a driver-side
+// latch bug (like the async_read/write/getdir one) breaks the suite
+// instead of passing silently because the master "conveniently" called
+// nothing.
+
+int valid_write(string, mixed, string) {
+  inherit_called++;
+  sizeof(allocate(2));  // 1-arg efuns: clobber st_num_arg to 1
+  return 1;
+}
+
+// valid_read:  called exactly the same as valid_write()
+
+int valid_read(string, mixed, string) {
+  inherit_called++;
+  member_array(0, ({ 1, 2 }), 0);  // 3-arg efun: clobber st_num_arg to 3
+  return 1;
+}
+
+// Tests can register a hook object to observe valid_bind() (and, e.g.,
+// destruct the prospective owner mid-bind -- see
+// tests/efuns/bind_destruct_owner.lpc). No hook = stock allow-all behavior.
+private object bind_hook;
+
+public void set_bind_hook(object ob) { bind_hook = ob; }
+
+int valid_bind(object binder, object old_owner, object new_owner) {
+  inherit_called++;
+  if (bind_hook) return bind_hook->valid_bind_hook(binder, old_owner, new_owner);
+  // This is really unsafe, but testsuite uses it to test bind()
+  return 1;
+}
+
+int valid_hide() {
+  inherit_called++;
+  // same here
+  return 1;
+}

@@ -1,0 +1,110 @@
+---
+title: 从源码构建
+description: 在 Ubuntu、macOS、Windows 和 WebAssembly 上从源码编译 FluffOS。
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# 从源码构建
+
+:::tip[先跑起来]
+编译只是一半。[先选一份 mudlib](start)。语言模型：[/llm](llm)（必须先问用哪份 lib，不要开 `testsuite/`）。
+:::
+
+**不要使用 v2017。** 当前支持的是 `master`（CMake，C++17）。CYGWIN 与 32 位目标已不再支持。
+
+## 支持的环境
+
+最佳平台：Ubuntu 22.04+（含 WSL）、最新 macOS（Intel 与 Apple Silicon）、Windows 上的 MSYS2/MINGW64。WebAssembly 见 [构建 WebAssembly](build-wasm)。
+
+**编译器：** 至少 GCC 7+ 或 LLVM Clang 4+。
+
+CI 覆盖的配置见仓库 `.github/workflows/ci.yml`：Ubuntu 24.04（GCC / Clang / 消毒器）、macOS 14、Windows MSYS2、Alpine 静态链接。
+
+系统库（按需）：ICU、jemalloc、OpenSSL、PCRE、MySQL 客户端、SQLite3、PostgreSQL、GoogleTest。捆绑的第三方库不必另装（libevent、libtelnet、libwebsockets 等）。
+
+## 平台指南
+
+<Tabs groupId="platform" queryString>
+<TabItem value="ubuntu" label="Ubuntu / WSL" default>
+
+```shell
+sudo apt update
+sudo apt install -y build-essential autoconf automake bison expect \
+  libmysqlclient-dev libpcre3-dev libpq-dev libsqlite3-dev \
+  libssl-dev libtool libz-dev telnet libjemalloc-dev libicu-dev \
+  libgtest-dev pkg-config libffi-dev
+
+git clone https://github.com/fluffos/fluffos.git
+cd fluffos
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo ..
+make -j "$(nproc)" install
+```
+
+二进制在 `build/bin/`。WSL 下仓库必须在 Linux 文件系统（`~/fluffos`），不要 `/mnt/c/...`。
+
+只需改 LPC 词法分析器（`src/compiler/internal/lexer.l`）时才需要 `flex`。
+
+</TabItem>
+<TabItem value="macos" label="macOS">
+
+```shell
+brew install cmake pkg-config pcre libgcrypt openssl jemalloc icu4c \
+  mysql sqlite3 googletest libffi
+
+git clone https://github.com/fluffos/fluffos.git
+cd fluffos
+mkdir build && cd build
+OPENSSL_ROOT_DIR="$(brew --prefix openssl)" ICU_ROOT="$(brew --prefix icu4c)" cmake ..
+make -j "$(sysctl -n hw.ncpu)" install
+```
+
+</TabItem>
+<TabItem value="windows" label="Windows / MSYS2">
+
+在 **MINGW64** shell 中：
+
+```shell
+pacman --noconfirm -S --needed \
+  git mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake \
+  mingw-w64-x86_64-zlib mingw-w64-x86_64-pcre \
+  mingw-w64-x86_64-icu mingw-w64-x86_64-sqlite3 \
+  mingw-w64-x86_64-jemalloc mingw-w64-x86_64-gtest \
+  mingw-w64-x86_64-pkgconf mingw-w64-x86_64-libffi \
+  bison make
+
+git clone https://github.com/fluffos/fluffos.git
+cd fluffos
+mkdir build && cd build
+cmake -G "MSYS Makefiles" -DCMAKE_BUILD_TYPE=Debug \
+  -DMARCH_NATIVE=OFF -DPACKAGE_CRYPTO=OFF \
+  -DPACKAGE_DB_MYSQL="" -DPACKAGE_DB_SQLITE=1 ..
+make -j $(nproc) install
+```
+
+</TabItem>
+<TabItem value="alpine" label="Alpine / Docker">
+
+```shell
+docker pull ghcr.io/fluffos/fluffos:master
+```
+
+或见英文 [构建指南](/build) 的 Alpine 静态链接步骤。
+
+</TabItem>
+</Tabs>
+
+## 测试
+
+```shell
+cd build
+CTEST_OUTPUT_ON_FAILURE=1 make test
+
+cd ../testsuite
+../build/bin/driver etc/config.test -ftest
+```
+
+交互启动（得到提示符）见 [从零到一个能连上的 MUD](start)。失败见 [排障](bug)。
+完整 CMake 开关与包选项以英文 [Build from Source](/build) 为准。

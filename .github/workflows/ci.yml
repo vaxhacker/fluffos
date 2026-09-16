@@ -4,17 +4,39 @@ on:
   push:
     branches: [master]
     paths-ignore: ['docs/**']
+  # No `branches:` filter on purpose: a pull request must be checked whatever
+  # its base is, so a PR stacked on another PR's branch still gets signal.
+  # (`push` stays master-only -- that is about building the mainline, not
+  # about gating review.)
   pull_request:
-    branches: [master]
     paths-ignore: ['docs/**']
+
+# Supersede an in-flight run when the same ref is pushed again. Without this
+# every push starts a full matrix and none of the older ones ever stop, so a
+# branch pushed a few times in quick succession has several complete runs
+# competing for the same runners and starving each other -- which looks
+# exactly like a CI outage. The default branch is exempt: master runs are the
+# release record and each commit's result is worth keeping.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 env:
   CTEST_OUTPUT_ON_FAILURE: 1
   VERBOSE: 1
-  # Common build types across all platforms
-  BUILD_TYPES: '["Debug", "RelWithDebInfo"]'
 
 jobs:
+  lpc-syntax:
+    name: lpc-syntax (tests + corpus format check)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run lpc-syntax test suite
+        run: node tools/lpc-syntax/test.mjs
+      - name: Verify testsuite corpus is formatted
+        run: testsuite/format.sh --check
+
   build-and-test:
     name: ${{ matrix.platform }} (${{ matrix.compiler || 'default' }}${{ matrix.sanitizer && '+sanitizer' || '' }}, ${{ matrix.build }})
     runs-on: ${{ matrix.os }}
@@ -22,21 +44,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Ubuntu - GCC
+          # Ubuntu - GCC (also builds the optional dwlib package so it can't
+          # silently bit-rot again)
           - platform: Ubuntu
             os: ubuntu-24.04
             compiler: gcc
             cc: gcc
             cxx: g++
             build: Debug
-            packages: build-essential autoconf automake bison expect libmysqlclient-dev libpcre3-dev libpq-dev libsqlite3-dev libssl-dev libtool libz-dev telnet libgtest-dev libjemalloc-dev
+            cmake_flags: -DPACKAGE_DWLIB=ON
+            packages: build-essential autoconf automake bison flex expect libmysqlclient-dev libpcre3-dev libpq-dev libsqlite3-dev libssl-dev libtool libz-dev telnet libgtest-dev libjemalloc-dev pkg-config libffi-dev
           - platform: Ubuntu
             os: ubuntu-24.04
             compiler: gcc
             cc: gcc
             cxx: g++
             build: RelWithDebInfo
-            packages: build-essential autoconf automake bison expect libmysqlclient-dev libpcre3-dev libpq-dev libsqlite3-dev libssl-dev libtool libz-dev telnet libgtest-dev libjemalloc-dev
+            cmake_flags: -DPACKAGE_DWLIB=ON
+            packages: build-essential autoconf automake bison flex expect libmysqlclient-dev libpcre3-dev libpq-dev libsqlite3-dev libssl-dev libtool libz-dev telnet libgtest-dev libjemalloc-dev pkg-config libffi-dev
 
           # Ubuntu - Clang
           - platform: Ubuntu
@@ -45,14 +70,14 @@ jobs:
             cc: clang
             cxx: clang++
             build: Debug
-            packages: build-essential autoconf automake bison expect libmysqlclient-dev libpcre3-dev libpq-dev libsqlite3-dev libssl-dev libtool libz-dev telnet libgtest-dev libjemalloc-dev
+            packages: build-essential autoconf automake bison flex expect libmysqlclient-dev libpcre3-dev libpq-dev libsqlite3-dev libssl-dev libtool libz-dev telnet libgtest-dev libjemalloc-dev pkg-config libffi-dev
           - platform: Ubuntu
             os: ubuntu-24.04
             compiler: clang
             cc: clang
             cxx: clang++
             build: RelWithDebInfo
-            packages: build-essential autoconf automake bison expect libmysqlclient-dev libpcre3-dev libpq-dev libsqlite3-dev libssl-dev libtool libz-dev telnet libgtest-dev libjemalloc-dev
+            packages: build-essential autoconf automake bison flex expect libmysqlclient-dev libpcre3-dev libpq-dev libsqlite3-dev libssl-dev libtool libz-dev telnet libgtest-dev libjemalloc-dev pkg-config libffi-dev
 
           # Ubuntu - Clang with Sanitizer
           - platform: Ubuntu
@@ -63,7 +88,7 @@ jobs:
             build: Debug
             sanitizer: true
             cmake_flags: -DENABLE_SANITIZER=ON
-            packages: build-essential autoconf automake bison expect libmysqlclient-dev libpcre3-dev libpq-dev libsqlite3-dev libssl-dev libtool libz-dev telnet libgtest-dev libjemalloc-dev libdw-dev libbz2-dev
+            packages: build-essential autoconf automake bison flex expect libmysqlclient-dev libpcre3-dev libpq-dev libsqlite3-dev libssl-dev libtool libz-dev telnet libgtest-dev libjemalloc-dev pkg-config libdw-dev libbz2-dev libffi-dev
           - platform: Ubuntu
             os: ubuntu-24.04
             compiler: clang
@@ -72,49 +97,27 @@ jobs:
             build: RelWithDebInfo
             sanitizer: true
             cmake_flags: -DENABLE_SANITIZER=ON
-            packages: build-essential autoconf automake bison expect libmysqlclient-dev libpcre3-dev libpq-dev libsqlite3-dev libssl-dev libtool libz-dev telnet libgtest-dev libjemalloc-dev libdw-dev libbz2-dev
+            packages: build-essential autoconf automake bison flex expect libmysqlclient-dev libpcre3-dev libpq-dev libsqlite3-dev libssl-dev libtool libz-dev telnet libgtest-dev libjemalloc-dev pkg-config libdw-dev libbz2-dev libffi-dev
 
           # macOS
           - platform: macOS
             os: macos-14
             build: Debug
-            packages: cmake pkg-config pcre libgcrypt openssl jemalloc icu4c mysql sqlite3 googletest
+            packages: cmake pkg-config pcre libgcrypt openssl jemalloc icu4c mysql sqlite3 googletest flex bison libffi
             openssl_root: /usr/local/opt/openssl
             icu_root: /opt/homebrew/opt/icu4c
           - platform: macOS
             os: macos-14
             build: RelWithDebInfo
-            packages: cmake pkg-config pcre libgcrypt openssl jemalloc icu4c mysql sqlite3 googletest
+            packages: cmake pkg-config pcre libgcrypt openssl jemalloc icu4c mysql sqlite3 googletest flex bison libffi
             openssl_root: /usr/local/opt/openssl
             icu_root: /opt/homebrew/opt/icu4c
 
-          # Windows
-          - platform: Windows
-            os: windows-latest
-            shell: msys2 {0}
-            build: Debug
-            cmake_generator: MSYS Makefiles
-            cmake_flags: -DMARCH_NATIVE=OFF -DPACKAGE_CRYPTO=OFF -DPACKAGE_DB_MYSQL="" -DPACKAGE_DB_SQLITE=1
-            packages: mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake mingw-w64-x86_64-zlib mingw-w64-x86_64-pcre mingw-w64-x86_64-icu mingw-w64-x86_64-sqlite3 mingw-w64-x86_64-jemalloc mingw-w64-x86_64-gtest bison make
-          - platform: Windows
-            os: windows-latest
-            shell: msys2 {0}
-            build: RelWithDebInfo
-            cmake_generator: MSYS Makefiles
-            cmake_flags: -DMARCH_NATIVE=OFF -DPACKAGE_CRYPTO=OFF -DPACKAGE_DB_MYSQL="" -DPACKAGE_DB_SQLITE=1
-            packages: mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake mingw-w64-x86_64-zlib mingw-w64-x86_64-pcre mingw-w64-x86_64-icu mingw-w64-x86_64-sqlite3 mingw-w64-x86_64-jemalloc mingw-w64-x86_64-gtest bison make
-
-    defaults:
-      run:
-        shell: ${{ matrix.shell || 'bash' }}
+    # Windows (MSYS2), the static Alpine build, and WASM are separate jobs
+    # below -- each wraps a composite action in .github/actions/ that the
+    # release workflow reuses, so a release-only build can't silently break.
 
     steps:
-      - name: Setup MSYS2 (Windows)
-        if: matrix.platform == 'Windows'
-        uses: msys2/setup-msys2@v2
-        with:
-          update: true
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -128,27 +131,28 @@ jobs:
         if: matrix.platform == 'macOS'
         env:
           HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
-        run: brew install ${{ matrix.packages }}
-
-      - name: Install Dependencies (Windows)
-        if: matrix.platform == 'Windows'
-        run: pacman --noconfirm -S --needed ${{ matrix.packages }}
+        run: |
+          brew install ${{ matrix.packages }}
+          # Homebrew flex/bison are keg-only (they'd shadow the too-old
+          # system copies); put their bin dirs on PATH so CMake's
+          # find_package(FLEX 2.6)/(BISON 3.8) picks them up and the
+          # scanner/parser are regenerated from lex.l/grammar.y instead of
+          # falling back to the checked-in pre-generated sources.
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          # bison also needs its lib dir for -ly at link time on some setups.
+          echo "LDFLAGS=-L$(brew --prefix bison)/lib" >> "$GITHUB_ENV"
+          # libffi is keg-only on macOS; expose its pkg-config so
+          # pkg_check_modules(libffi) in package_ffi resolves it.
+          echo "PKG_CONFIG_PATH=$(brew --prefix libffi)/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
 
       - name: Configure
         run: |
           mkdir build && cd build
-          if [ "${{ matrix.platform }}" = "Windows" ]; then
-            cmake -G "${{ matrix.cmake_generator }}" \
-              -DCMAKE_BUILD_TYPE=${{ matrix.build }} \
-              ${{ matrix.cmake_flags }} \
-              -DPACKAGE_DB_SQLITE=2 \
-              ..
-          else
-            cmake -DCMAKE_BUILD_TYPE=${{ matrix.build }} \
-              ${{ matrix.cmake_flags }} \
-              -DPACKAGE_DB_SQLITE=2 \
-              ..
-          fi
+          cmake -DCMAKE_BUILD_TYPE=${{ matrix.build }} \
+            ${{ matrix.cmake_flags }} \
+            -DPACKAGE_DB_SQLITE=2 \
+            ..
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
@@ -162,7 +166,74 @@ jobs:
           ICU_ROOT: ${{ matrix.icu_root }}
 
       - name: Run Unit Tests
-        run: cd build && make test
+        run: cd build && ctest --output-on-failure -LE testsuite
 
       - name: Run LPC Testsuite
-        run: cd testsuite && ../build/bin/driver etc/config.test -ftest
+        run: cd build && ctest --output-on-failure -L testsuite
+
+      # Only on Clang Debug (with and without the sanitizer) -- it's the
+      # only test that drives real websocket client traffic against the
+      # native driver (see src/www/AGENTS.md); the sanitizer variant also
+      # catches memory-safety bugs in the ws_telnet.cc/ws_ascii.cc nudge
+      # timer that ctest's unit/LPC suites can't reach.
+      - name: Websocket smoke test
+        if: matrix.platform == 'Ubuntu' && matrix.compiler == 'clang' && matrix.build == 'Debug'
+        run: node tools/ws-smoke.js build/src/driver testsuite
+
+  # Windows (MSYS2/MinGW64). Uses the same build-windows composite as the
+  # release workflow, so the release build can't break in a way CI misses.
+  windows:
+    name: Windows (${{ matrix.build }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [Debug, RelWithDebInfo]
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build & test
+        uses: ./.github/actions/build-windows
+        with:
+          build-type: ${{ matrix.build }}
+          db-sqlite: '2'
+          # flex regenerates the lexer from lexer.l instead of using the
+          # checked-in pre-generated source.
+          extra-packages: flex
+
+  # Statically-linked Alpine build. Uses the same build-alpine-static
+  # composite the release workflow ships as
+  # fluffos-<version>-linux-x86_64-static.tar.gz, so a missing/renamed Alpine
+  # package is caught on every PR instead of at release time.
+  alpine-static:
+    name: Alpine (static)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build & test
+        uses: ./.github/actions/build-alpine-static
+
+  # WebAssembly build: cross-compile the driver with Emscripten and run the
+  # full LPC testsuite inside the wasm driver under node, via the same
+  # build-wasm composite the release workflow uses. See docs/build-wasm.md
+  # for the workflow and src/wasm/README.md for the architecture.
+  wasm:
+    name: WASM (Emscripten)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build & test
+        uses: ./.github/actions/build-wasm

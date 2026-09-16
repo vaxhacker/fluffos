@@ -1,5 +1,4 @@
 ---
-layout: doc
 title: stdlib / all_environment
 ---
 # all_environment
@@ -24,7 +23,7 @@ title: stdlib / all_environment
     If a player has a coin in a bag, and youi ask for all_environment() on
     the the coin, it will return:
 
-    ({ bag, player, room })
+    (\{ bag, player, room \})
 
 ### SEE ALSO
 

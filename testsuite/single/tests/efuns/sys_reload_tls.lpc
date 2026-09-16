@@ -1,0 +1,66 @@
+// No TLS on the wasm target: the sys_reload_tls efun does not exist
+// there (the page terminates TLS), so this file must not reference it.
+#ifndef __WASM__
+void do_tests_real() {
+  int i;
+  int saw_ws_plain = 0;
+  int saw_ws_tls = 0;
+  mixed ports;
+
+  // non tls port
+  ASSERT_NE(0, catch(sys_reload_tls(0)));
+
+  // valid telnet tls (config.test external_port_4)
+  ASSERT_EQ(0, sys_reload_tls(4));
+
+  // Walk the live port table so a config.test port shuffle can't silently
+  // pin the wrong index. Plain websocket must still refuse (no cert);
+  // websocket TLS must reload from disk the same way telnet TLS does.
+  ports = sys_network_ports();
+  for (i = 0; i < sizeof(ports); i++) {
+    mixed p = ports[i];
+    if (p[1] != "websocket") {
+      continue;
+    }
+    if (p[3]) {
+      ASSERT_EQ(0, sys_reload_tls(p[0]));
+      saw_ws_tls = 1;
+    } else {
+      ASSERT_NE(0, catch(sys_reload_tls(p[0])));
+      saw_ws_plain = 1;
+    }
+  }
+  ASSERT(saw_ws_plain);
+  ASSERT(saw_ws_tls);
+
+  // Regression: the index bound used sizeof(external_port) (the array's size in
+  // BYTES) instead of its element count (5), letting indices in the gap slip
+  // through to an out-of-bounds read and a wild tls_server_close()/->ssl write.
+  // Index 8 lands in that old gap; it and a negative index must error cleanly.
+  ASSERT_NE(0, catch(sys_reload_tls(8)));
+  ASSERT_NE(0, catch(sys_reload_tls(-1)));
+}
+void after_boot() {
+  mixed err;
+  write("boot finished, doing test.\n");
+
+  err = catch(do_tests_real());
+
+  if (err) {
+    debug_message(err);
+    shutdown(-1);
+  }
+
+  write("sys_reload_tls: succeed.\n");
+}
+void do_tests() {
+  write("waiting for boot...\n");
+
+  call_out("after_boot", 0);
+}
+
+#else
+void do_tests() {
+  ASSERT(1);
+}
+#endif

@@ -3,6 +3,7 @@
 #include "vm/internal/base/machine.h"
 
 #include <nlohmann/json.hpp>
+#include <vector>
 using json = nlohmann::json;
 
 // FIXME: move init from main() to compile time;
@@ -16,7 +17,7 @@ svalue_t const0u{T_NUMBER, T_UNDEFINED, {0}};
  * (as all identifiers are kept in a array pointed to by the object).
  */
 
-void assign_svalue_no_free(svalue_t *to, svalue_t *from) {
+void assign_svalue_no_free(svalue_t* to, svalue_t* from) {
   DEBUG_CHECK(from == 0, "Attempt to assign_svalue() from a null ptr.\n");
   DEBUG_CHECK(to == 0, "Attempt to assign_svalue() to a null ptr.\n");
   DEBUG_CHECK((from->type & (from->type - 1)) & ~T_FREED, "from->type is corrupt; >1 bit set.\n");
@@ -35,7 +36,8 @@ void assign_svalue_no_free(svalue_t *to, svalue_t *from) {
   if (from->type == T_STRING) {
     if (from->subtype & STRING_COUNTED) {
       INC_COUNTED_REF(to->u.string);
-      md_record_ref_journal(PTR_TO_NODET(to->u.string), true, MSTR_REF(to->u.string), __CURRENT_FILE_LINE__);
+      md_record_ref_journal(PTR_TO_NODET(to->u.string), true, MSTR_REF(to->u.string),
+                            __CURRENT_FILE_LINE__);
       ADD_STRING(MSTR_SIZE(to->u.string));
       NDBG(BLOCK(to->u.string));
     }
@@ -45,14 +47,15 @@ void assign_svalue_no_free(svalue_t *to, svalue_t *from) {
       md_record_ref_journal(PTR_TO_NODET(from->u.ob), true, from->u.ob->ref, __CURRENT_FILE_LINE__);
     } else {
       from->u.refed->ref++;
-      if (from->u.refed != (void *) &the_null_array && from->u.refed != (void *) &null_buf) {
-        md_record_ref_journal(PTR_TO_NODET(from->u.refed), true, from->u.refed->ref, __CURRENT_FILE_LINE__);
+      if (from->u.refed != (void*)&the_null_array && from->u.refed != (void*)&null_buf) {
+        md_record_ref_journal(PTR_TO_NODET(from->u.refed), true, from->u.refed->ref,
+                              __CURRENT_FILE_LINE__);
       }
     }
   }
 }
 
-void assign_svalue(svalue_t *dest, svalue_t *v) {
+void assign_svalue(svalue_t* dest, svalue_t* v) {
   /* First deallocate the previous value. */
   free_svalue(dest, "assign_svalue");
   assign_svalue_no_free(dest, v);
@@ -62,10 +65,69 @@ void assign_svalue(svalue_t *dest, svalue_t *v) {
  * Copies an array of svalues to another location, which should be
  * free space.
  */
-void copy_some_svalues(svalue_t *dest, svalue_t *v, int num) {
+void copy_some_svalues(svalue_t* dest, svalue_t* v, int num) {
   while (num--) {
     assign_svalue_no_free(dest + num, v + num);
   }
+}
+
+namespace {
+// dealloc_array()/dealloc_mapping()/dealloc_class() each loop over their
+// children calling free_svalue(), which recurses right back into
+// int_free_svalue() below whenever a child is itself a compound value
+// hitting ref 0 -- unboundedly, for e.g. a singly-nested array chain built
+// by `mixed a = 0; for (...) a = ({a});`. Only the OUTERMOST call actually
+// invokes dealloc_*() synchronously; any compound child discovered while
+// one is already running is queued here instead of recursed into, and
+// drained in a loop after the outer call returns -- so C-stack usage stays
+// O(1) regardless of nesting depth. Order of the drain doesn't matter
+// (every queued pointer is unreachable garbage the moment it's queued);
+// only that each is eventually dealloc'd exactly once.
+struct PendingCompoundFree {
+  void* ptr;
+  uint32_t type;  // T_ARRAY, T_CLASS, T_MAPPING, or T_PROMISE
+};
+bool g_freeing_compound = false;
+std::vector<PendingCompoundFree>* g_pending_compound_frees = nullptr;
+
+}  // namespace
+
+static void dealloc_one_compound(void* ptr, uint32_t type) {
+  switch (type) {
+    case T_PROMISE:
+      dealloc_promise(reinterpret_cast<promise_t*>(ptr));
+      break;
+    case T_CLASS:
+      dealloc_class(reinterpret_cast<array_t*>(ptr));
+      break;
+    case T_ARRAY:
+      dealloc_array(reinterpret_cast<array_t*>(ptr));
+      break;
+    case T_MAPPING:
+      dealloc_mapping(reinterpret_cast<mapping_t*>(ptr));
+      break;
+  }
+}
+
+// Dispatches one T_ARRAY/T_CLASS/T_MAPPING deallocation, deferring to the
+// queue above if a dealloc_*() call is already in progress further up the
+// (now-flat) call chain.
+void free_compound(void* ptr, uint32_t type) {
+  if (g_freeing_compound) {
+    if (!g_pending_compound_frees) {
+      g_pending_compound_frees = new std::vector<PendingCompoundFree>();
+    }
+    g_pending_compound_frees->push_back({ptr, type});
+    return;
+  }
+  g_freeing_compound = true;
+  dealloc_one_compound(ptr, type);
+  while (g_pending_compound_frees && !g_pending_compound_frees->empty()) {
+    PendingCompoundFree next = g_pending_compound_frees->back();
+    g_pending_compound_frees->pop_back();
+    dealloc_one_compound(next.ptr, next.type);
+  }
+  g_freeing_compound = false;
 }
 
 /*
@@ -74,25 +136,25 @@ void copy_some_svalues(svalue_t *dest, svalue_t *v, int num) {
  * Use the free_svalue() define to call this
  */
 #ifdef DEBUG
-void int_free_svalue(svalue_t *v, const char *tag)
+void int_free_svalue(svalue_t* v, const char* tag)
 #else
-void int_free_svalue(svalue_t *v)
+void int_free_svalue(svalue_t* v)
 #endif
 {
   if (v->type == T_STRING) {
-    const char *str = v->u.string;
+    const char* str = v->u.string;
 
     if (v->subtype & STRING_COUNTED) {
       int size = MSTR_SIZE(str);
       if (DEC_COUNTED_REF(str)) {
 #ifdef DEBUGMALLOC_EXTENSIONS
         md_record_ref_journal(PTR_TO_NODET(str), false, MSTR_REF(str), tag);
-#endif // DEBUGMALLOC_EXTENSIONS
+#endif  // DEBUGMALLOC_EXTENSIONS
         SUB_STRING(size);
         NDBG(BLOCK(str));
         if (v->subtype & STRING_HASHED) {
           SUB_NEW_STRING(size, sizeof(block_t));
-          deallocate_string(const_cast<char *>(str));
+          deallocate_string(const_cast<char*>(str));
           CHECK_STRING_STATS;
         } else {
           SUB_NEW_STRING(size, sizeof(malloc_block_t));
@@ -102,7 +164,7 @@ void int_free_svalue(svalue_t *v)
       } else {
 #ifdef DEBUGMALLOC_EXTENSIONS
         md_record_ref_journal(PTR_TO_NODET(str), false, MSTR_REF(str), tag);
-#endif // DEBUGMALLOC_EXTENSIONS
+#endif  // DEBUGMALLOC_EXTENSIONS
         SUB_STRING(size);
         NDBG(BLOCK(str));
       }
@@ -115,37 +177,50 @@ void int_free_svalue(svalue_t *v)
     }
 #endif
     /* TODO: Set to 0 on condition that REF overflow to negative. */
+    bool reached_zero = false;
     if (v->u.refed->ref > 0) {
       v->u.refed->ref--;
+      reached_zero = (v->u.refed->ref == 0);
 #ifdef DEBUGMALLOC_EXTENSIONS
-      if (v->u.refed != (void *) &the_null_array && v->u.refed != (void *) &null_buf) {
+      if (v->u.refed != (void*)&the_null_array && v->u.refed != (void*)&null_buf) {
         md_record_ref_journal(PTR_TO_NODET(v->u.refed), false, v->u.refed->ref, tag);
       }
-#endif // DEBUGMALLOC_EXTENSIONS
+#endif  // DEBUGMALLOC_EXTENSIONS
     }
-    if (v->u.refed->ref == 0) {
+    /* Only deallocate when THIS call performed the 1 -> 0 decrement. The
+     * underflow guard above used to suppress just the decrement while the
+     * unconditional `ref == 0` check still ran the dealloc -- so a second
+     * aliased svalue freeing an already-deallocated value (ref reads 0 from
+     * freed memory) triggered a second dealloc instead of containing the
+     * corruption. */
+    if (reached_zero) {
       switch (v->type) {
         case T_OBJECT:
           dealloc_object(v->u.ob, "free_svalue");
           break;
         case T_CLASS:
-          dealloc_class(v->u.arr);
+          free_compound(v->u.arr, T_CLASS);
           break;
         case T_ARRAY:
           if (v->u.arr != &the_null_array) {
-            dealloc_array(v->u.arr);
+            free_compound(v->u.arr, T_ARRAY);
           }
           break;
         case T_BUFFER:
           if (v->u.buf != &null_buf) {
-            FREE((char *)v->u.buf);
+            FREE((char*)v->u.buf);
           }
           break;
         case T_MAPPING:
-          dealloc_mapping(v->u.map);
+          free_compound(v->u.map, T_MAPPING);
           break;
         case T_FUNCTION:
           dealloc_funp(v->u.fp);
+          break;
+        case T_PROMISE:
+          /* deferred like arrays/mappings: dropping a long then()-chain
+           * must not recurse the C stack away. */
+          free_compound(v->u.prom, T_PROMISE);
           break;
         case T_REF:
           if (!v->u.ref->lvalue) {
@@ -157,6 +232,9 @@ void int_free_svalue(svalue_t *v)
     }
   } else if (v->type == T_ERROR_HANDLER) {
     (*v->u.error_handler)();
+    v->type |= T_FREED;
+  } else if (v->type == T_LVALUE_CODEPOINT || v->type == T_LVALUE_RANGE) {
+    free_indexed_lvalue(v);
     v->type |= T_FREED;
   }
 #ifdef DEBUG
@@ -176,7 +254,7 @@ void int_free_svalue(svalue_t *v)
  * Converts any LPC datatype into json format, only value types are supported.
  */
 constexpr int _max_depth = 256;
-json svalue_to_json_summary(const svalue_t *obj, int depth) {
+json svalue_to_json_summary(const svalue_t* obj, int depth) {
   /* prevent an infinite recursion on self-referential structures */
   if (depth >= _max_depth) {
     return "truncated";
@@ -190,6 +268,17 @@ json svalue_to_json_summary(const svalue_t *obj, int depth) {
       return {{"ref", (intptr_t)obj->u.ref->lvalue}};
     case T_FUNCTION:
       return "function";
+    case T_PROMISE:
+      switch (obj->u.prom->state) {
+        case PROMISE_FULFILLED:
+          return "promise (fulfilled)";
+        case PROMISE_REJECTED:
+          return "promise (rejected)";
+        case PROMISE_CANCELLED:
+          return "promise (cancelled)";
+        default:
+          return "promise (pending)";
+      }
     case T_NUMBER:
       return obj->u.number;
     case T_REAL:
@@ -200,7 +289,7 @@ json svalue_to_json_summary(const svalue_t *obj, int depth) {
         return obj->u.string;
       }
       return std::string(obj->u.string,
-                         u8_truncate(reinterpret_cast<const uint8_t *>(obj->u.string), 32)) +
+                         u8_truncate(reinterpret_cast<const uint8_t*>(obj->u.string), 32)) +
              "...(len:" + std::to_string(len) + ")";
     }
     case T_CLASS:
@@ -227,9 +316,9 @@ json svalue_to_json_summary(const svalue_t *obj, int depth) {
     }
     case T_MAPPING: {
       json res = json::object();
-      auto limit = std::min(5u, obj->u.map->count);
+      auto limit = std::min(5u, MAP_COUNT(obj->u.map));
       for (int i = 0; i < obj->u.map->table_size; i++) {
-        mapping_node_t *elm;
+        mapping_node_t* elm;
         for (elm = obj->u.map->table[i]; elm; elm = elm->next) {
           auto key = &(elm->values[0]);
           auto val = &(elm->values[1]);
@@ -243,8 +332,8 @@ json svalue_to_json_summary(const svalue_t *obj, int depth) {
           }
         }
       }
-      if (obj->u.map->count > 4) {
-        res["_sizeof"] = std::to_string(obj->u.map->count);
+      if (MAP_COUNT(obj->u.map) > 4) {
+        res["_sizeof"] = std::to_string(MAP_COUNT(obj->u.map));
       }
       return res;
     }

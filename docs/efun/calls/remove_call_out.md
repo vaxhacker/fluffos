@@ -1,5 +1,4 @@
 ---
-layout: doc
 title: calls / remove_call_out
 ---
 # remove_call_out
@@ -26,6 +25,11 @@ title: calls / remove_call_out
     value is the number of remaining seconds before the call_out was to  be
     called,  or -1  if  there  was  no  valid  call_out  identified  by the
     specified <handle>.
+
+    A handle stays valid until its call out fires or is removed, no matter
+    how many newer call outs have been scheduled since it was created. A
+    <handle> of 0 (typically an uninitialized variable) or a handle that
+    does not identify a pending call out returns -1.
 
     In the third form all pending call outs for the current object will be
     removed. In this case the return value is always 0.

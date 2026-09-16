@@ -5,6 +5,7 @@
 #include <string>
 #include <memory>
 #include <cstring>
+#include <unordered_set>
 
 #include "thirdparty/utf8_decoder_dfa/decoder.h"
 #include "thirdparty/widecharwidth/widechar_width.h"
@@ -13,18 +14,19 @@
 #include "base/internal/log.h"
 #include "base/internal/rc.h"
 #include "base/internal/EGCIterator.h"
+#include "base/internal/stralloc.h"
 
-bool u8_validate(char **s) {
-  const auto *p = (const uint8_t *)(*s);
+bool u8_validate(char** s) {
+  const auto* p = (const uint8_t*)(*s);
   uint32_t codepoint, state = 0;
 
   while (*p && state != UTF8_REJECT) decode(&state, &codepoint, *p++);
-  *s = (char *)p;
+  *s = (char*)p;
   return state == UTF8_ACCEPT;
 }
 
-bool u8_validate(const char *s) {
-  const auto *p = (const uint8_t *)s;
+bool u8_validate(const char* s) {
+  const auto* p = (const uint8_t*)s;
   uint32_t codepoint, state = 0;
 
   while (*p && state != UTF8_REJECT) decode(&state, &codepoint, *p++);
@@ -32,8 +34,8 @@ bool u8_validate(const char *s) {
   return state == UTF8_ACCEPT;
 }
 
-bool u8_validate(const uint8_t *s, size_t len) {
-  const auto *end = s + len;
+bool u8_validate(const uint8_t* s, size_t len) {
+  const auto* end = s + len;
   uint32_t codepoint, state = 0;
 
   while (s < end && *s && state != UTF8_REJECT) decode(&state, &codepoint, *s++);
@@ -43,17 +45,66 @@ bool u8_validate(const uint8_t *s, size_t len) {
 
 std::string u8_sanitize(std::string_view src) { return utf8::replace_invalid(src); }
 
+size_t u8_incomplete_tail(std::string_view buf) {
+  const size_t n = buf.size();
+  const size_t scan = n < 3 ? n : 3;
+
+  for (size_t back = 1; back <= scan; back++) {
+    const auto c = static_cast<unsigned char>(buf[n - back]);
+    if ((c & 0xc0) == 0x80) continue;  // continuation byte: keep scanning for the lead
+    size_t len;
+    if (c >= 0xc2 && c < 0xe0) {
+      len = 2;
+    } else if (c >= 0xe0 && c < 0xf0) {
+      len = 3;
+    } else if (c >= 0xf0 && c <= 0xf4) {
+      len = 4;
+    } else {
+      return 0;  // ASCII or invalid lead: nothing worth waiting for
+    }
+    return len > back ? back : 0;  // incomplete -> hold `back` bytes
+  }
+  return 0;  // 3 continuations with no lead: malformed, deliver as-is
+}
+
 // Search "needle' in 'haystack', making sure it matches EGC boundary, returning byte offset.
-int32_t u8_egc_find_as_offset(EGCIterator &iter, const char *needle, size_t needle_len,
+int32_t u8_egc_find_as_offset(EGCIterator& iter, const char* needle, size_t needle_len,
                               bool reverse) {
-  const char *haystack = iter.data();
-  size_t const haystack_len = iter.len() == -1 ? strlen(haystack) : iter.len();
+  if (!iter.ok()) return -1;
+
+  const char* haystack = iter.data();
+  int32_t const raw_len = iter.len();
+  // Only -1 means NUL-terminated. Casting any other negative to size_t
+  // made the ASCII string_view path scan off the mapping (SIGSEGV).
+  if (raw_len < -1) return -1;
+  size_t const haystack_len = raw_len == -1 ? strlen(haystack) : static_cast<size_t>(raw_len);
 
   // no way
   if (needle_len > haystack_len) {
     return -1;
   }
-  if (!iter.ok()) return -1;
+
+  // Haystack already proven CR-free ASCII: every byte is a grapheme
+  // boundary, so find/rfind is EGC-correct and must not touch ICU.
+  // explode()'s trailing-delimiter walk used the reverse path, which
+  // previously always called isBoundary() and so ensure_icu()'d the
+  // whole remaining string on every token. A needle with a high bit or
+  // CR cannot occur in this haystack.
+  if (iter.is_ascii()) {
+    bool needle_ascii = true;
+    for (size_t i = 0; i < needle_len; i++) {
+      auto c = static_cast<unsigned char>(needle[i]);
+      if (c >= 0x80u || c == '\r') {
+        needle_ascii = false;
+        break;
+      }
+    }
+    if (!needle_ascii) return -1;
+    std::string_view const hay(haystack, haystack_len);
+    std::string_view const ndl(needle, needle_len);
+    auto pos = reverse ? hay.rfind(ndl) : hay.find(ndl);
+    return pos == std::string_view::npos ? -1 : static_cast<int32_t>(pos);
+  }
 
   // fast track ascii string search upto 4 characters.
   if (!reverse) {
@@ -66,11 +117,17 @@ int32_t u8_egc_find_as_offset(EGCIterator &iter, const char *needle, size_t need
       if (i == 3) is_all_ascii = false;
     }
     if (is_all_ascii) {
-      // strstr doesn't follow haystack_len, so we may overrun, wasting some cycles.
-      const auto *res = strstr(haystack, needle);
+      // strstr does not honor haystack_len. explode()'s trailing-delimiter
+      // trim shortens the count but leaves the C string intact, so a match
+      // can start inside the counted range and extend past it. Accepting
+      // that made sourcelen go negative. Reject unless the whole needle
+      // sits in [0, haystack_len).
+      const auto* res = strstr(haystack, needle);
       auto ret = res == nullptr ? -1 : (decltype(haystack))res - haystack;
-      if (ret >= haystack_len) ret = -1;
-      return ret;
+      if (ret < 0 || static_cast<size_t>(ret) > haystack_len - needle_len) {
+        return -1;
+      }
+      return static_cast<int32_t>(ret);
     }
   }
 
@@ -89,6 +146,12 @@ int32_t u8_egc_find_as_offset(EGCIterator &iter, const char *needle, size_t need
     pos = std::string_view::npos;
     while ((pos = sv_haystack.rfind(sv_needle, pos)) != std::string_view::npos) {
       if (iter->isBoundary(pos) && iter->isBoundary(pos + sv_needle.length())) break;
+      // A match at offset 0 that is not grapheme-aligned must not decrement to
+      // npos and re-find offset 0 forever; report "no match" instead.
+      if (pos == 0) {
+        pos = std::string_view::npos;
+        break;
+      }
       pos--;
     }
   }
@@ -101,7 +164,7 @@ int32_t u8_egc_find_as_offset(EGCIterator &iter, const char *needle, size_t need
 // Return the egc at given index of src, if it is an single code point.
 // Return -2 if requested index is out of bounds
 // Return -1 if requested EGC is multi codepoint
-UChar32 u8_egc_index_as_single_codepoint(const char *src, int32_t src_len, int32_t index) {
+UChar32 u8_egc_index_as_single_codepoint(const char* src, int32_t src_len, int32_t index) {
   UChar32 c = U_SENTINEL;
 
   EGCSmartIterator iter(src, src_len);
@@ -111,19 +174,21 @@ UChar32 u8_egc_index_as_single_codepoint(const char *src, int32_t src_len, int32
   // out-of-bounds
   if (pos < 0) return -2;
   auto post_pos = iter.post_index_to_offset(index);
-  // end-of-string
+  // Index landed on the final break position (one past the last EGC):
+  // return 0, the virtual NUL terminator. This is deliberate C-string
+  // compat -- s[strlen(s)] == 0 -- pinned by tests/operators/string_index.lpc.
   if (post_pos < 0) return 0;
 
   if (post_pos - pos > U8_MAX_LENGTH) return c;
-  U8_NEXT((const uint8_t *)src, pos, -1, c);
+  U8_NEXT((const uint8_t*)src, pos, -1, c);
   return c;
 }
 
 // Copy string src to dest, replacing character at index to c. Assuming dst is already allocated.
-void u8_copy_and_replace_codepoint_at(EGCSmartIterator &iter, char *dst, int32_t index, UChar32 c) {
+void u8_copy_and_replace_codepoint_at(EGCSmartIterator& iter, char* dst, int32_t index, UChar32 c) {
   if (!iter.ok()) return;
 
-  const char *src = iter.data();
+  const char* src = iter.data();
   int32_t const slen = iter.len();
 
   int32_t src_offset = iter.index_to_offset(index);
@@ -139,9 +204,17 @@ void u8_copy_and_replace_codepoint_at(EGCSmartIterator &iter, char *dst, int32_t
 }
 
 // Get the byte offset to the egc index, return -1 for non boundary.
-int32_t u8_offset_to_egc_index(EGCIterator &iter, int32_t offset) {
+int32_t u8_offset_to_egc_index(EGCIterator& iter, int32_t offset) {
   if (offset <= 0) return offset;
   if (!iter.ok()) return -1;
+
+  // CR-free ASCII: every byte is a cluster boundary, so the EGC index is
+  // the byte offset. Driving ICU here (via operator->) is what made
+  // strsrch() of a long ASCII haystack pay a full setText + walk after
+  // strchr already found the match — same class of miss as #1366.
+  if (iter.is_ascii()) {
+    return offset > iter.len() ? -1 : offset;
+  }
 
   int idx = -1;
   int pos = 0;
@@ -160,8 +233,8 @@ int32_t u8_offset_to_egc_index(EGCIterator &iter, int32_t offset) {
 }
 
 // same as strncpy, copy up to maxlen bytes but will not copy broken characters.
-int32_t u8_strncpy(uint8_t *dest, const uint8_t *src, const int32_t maxlen) {
-  auto len = u8_truncate(src, strnlen(reinterpret_cast<const char *>(src), maxlen));
+int32_t u8_strncpy(uint8_t* dest, const uint8_t* src, const int32_t maxlen) {
+  auto len = u8_truncate(src, strnlen(reinterpret_cast<const char*>(src), maxlen));
   if (len != maxlen) {
     memset(dest + len, '\0', maxlen - len);
   }
@@ -189,7 +262,7 @@ int32_t u8_strncpy(uint8_t *dest, const uint8_t *src, const int32_t maxlen) {
  */
 #ifndef U8_IS_VALID_LEAD3_AND_T1
 #define U8_IS_VALID_LEAD3_AND_T1(lead, t1) \
-  (U8_LEAD3_T1_BITS[(lead)&0xf] & (1 << ((uint8_t)(t1) >> 5)))
+  (U8_LEAD3_T1_BITS[(lead) & 0xf] & (1 << ((uint8_t)(t1) >> 5)))
 #endif
 
 /**
@@ -211,7 +284,7 @@ int32_t u8_strncpy(uint8_t *dest, const uint8_t *src, const int32_t maxlen) {
  */
 #ifndef U8_IS_VALID_LEAD4_AND_T1
 #define U8_IS_VALID_LEAD4_AND_T1(lead, t1) \
-  (U8_LEAD4_T1_BITS[(uint8_t)(t1) >> 4] & (1 << ((lead)&7)))
+  (U8_LEAD4_T1_BITS[(uint8_t)(t1) >> 4] & (1 << ((lead) & 7)))
 #endif
 /**
  * If the string ends with a UTF-8 byte sequence that is valid so far
@@ -243,20 +316,20 @@ int32_t u8_strncpy(uint8_t *dest, const uint8_t *src, const int32_t maxlen) {
 #define U8_TRUNCATE_IF_INCOMPLETE(s, start, length)                                   \
   do {                                                                                \
     if ((length) > (start)) {                                                         \
-      uint8_t __b1 = s[(length)-1];                                                   \
+      uint8_t __b1 = s[(length) - 1];                                                 \
       if (U8_IS_SINGLE(__b1)) {                                                       \
         /* common ASCII character */                                                  \
       } else if (U8_IS_LEAD(__b1)) {                                                  \
         --(length);                                                                   \
-      } else if (U8_IS_TRAIL(__b1) && ((length)-2) >= (start)) {                      \
-        uint8_t __b2 = s[(length)-2];                                                 \
+      } else if (U8_IS_TRAIL(__b1) && ((length) - 2) >= (start)) {                    \
+        uint8_t __b2 = s[(length) - 2];                                               \
         if (0xe0 <= __b2 && __b2 <= 0xf4) {                                           \
           if (__b2 < 0xf0 ? U8_IS_VALID_LEAD3_AND_T1(__b2, __b1)                      \
                           : U8_IS_VALID_LEAD4_AND_T1(__b2, __b1)) {                   \
             (length) -= 2;                                                            \
           }                                                                           \
-        } else if (U8_IS_TRAIL(__b2) && ((length)-3) >= (start)) {                    \
-          uint8_t __b3 = s[(length)-3];                                               \
+        } else if (U8_IS_TRAIL(__b2) && ((length) - 3) >= (start)) {                  \
+          uint8_t __b3 = s[(length) - 3];                                             \
           if (0xf0 <= __b3 && __b3 <= 0xf4 && U8_IS_VALID_LEAD4_AND_T1(__b3, __b2)) { \
             (length) -= 3;                                                            \
           }                                                                           \
@@ -267,7 +340,7 @@ int32_t u8_strncpy(uint8_t *dest, const uint8_t *src, const int32_t maxlen) {
 #endif
 
 // truncate strlen() to last valid codepoint
-size_t u8_truncate(const uint8_t *src, size_t len) {
+size_t u8_truncate(const uint8_t* src, size_t len) {
   int32_t res = len;
   U8_TRUNCATE_IF_INCOMPLETE(src, 0, res);
   return res;
@@ -277,8 +350,8 @@ size_t u8_truncate(const uint8_t *src, size_t len) {
 // new len. If brake_at_space, then attempts to truncate before the last ' ' character. If
 // always_break_at_newline, then always truncate to first '\n' character. Invalid codepoints are
 // replaced to 0xfffd;
-void u8_truncate_below_width(const char *src, size_t len, size_t max_width, bool break_for_line,
-                             bool always_break_before_newline, size_t *out_len, size_t *out_width) {
+void u8_truncate_below_width(const char* src, size_t len, size_t max_width, bool break_for_line,
+                             bool always_break_before_newline, size_t* out_len, size_t* out_width) {
   if (len == 0) {
     *out_len = 0;
     *out_width = 0;
@@ -425,14 +498,29 @@ void u8_truncate_below_width(const char *src, size_t len, size_t max_width, bool
   }
 
   if (break_for_line) {
-    // Try to find an better line break point
+    // Try to find a better line break point
     if (!hardwrap && src[break_length] != ' ' && !linebrk->isBoundary(break_length)) {
       auto prev_linebreak = linebrk->preceding(break_length);
-      // Suitable breakpoints
       if (prev_linebreak > 0) {
-        break_length = prev_linebreak;
-        break_width = u8_width(src, break_length);
+        // Only accept the earlier break point if it leaves visible text
+        // on this line: breaking right after a leading-space indent
+        // produced a bogus " " line and shifted the whole wrap grid;
+        // hard-wrap at the width instead (issue #605).
+        bool usable = false;
+        for (decltype(prev_linebreak) idx = 0; idx < prev_linebreak; idx++) {
+          if (src[idx] != ' ') {
+            usable = true;
+            break;
+          }
+        }
+        if (usable) {
+          break_length = prev_linebreak;
+          break_width = u8_width(src, break_length);
+        }
       } else {
+        // No break opportunity at all before the cut: a single word wider
+        // than the field overflows it whole (behavior pinned by the
+        // issue #696 narrow-column tests).
         auto next_linebreak = linebrk->following(break_length);
         if (next_linebreak > 0) {
           if (src[next_linebreak - 1] == '\n') {
@@ -460,7 +548,7 @@ void u8_truncate_below_width(const char *src, size_t len, size_t max_width, bool
 }
 
 // Total width of characters(grapheme cluster). Also adjust for east asain full width characters
-size_t u8_width(const char *src, int len) {
+size_t u8_width(const char* src, int len) {
   size_t total = 0;
   int32_t src_offset = 0;
 
@@ -478,14 +566,20 @@ size_t u8_width(const char *src, int len) {
     if (c == 0x200d || prev == 0x200d) {  // zwj, skip the next character
       continue;
     }
+    // An emoji (skin tone) modifier U+1F3FB..U+1F3FF merges into the
+    // preceding emoji base and adds no visible width of its own
+    // (issue #1007).
+    if (c >= 0x1F3FB && c <= 0x1F3FF && prev != 0) {
+      continue;
+    }
 
     // ignoring ANSI codes when calculating display width
     // https://en.wikipedia.org/wiki/ANSI_escape_code#Colors
     // format is "\x1b[X;Ym"
     if (CONFIG_INT(__RC_SPRINTF_ADD_JUSTFIED_IGNORE_ANSI_COLORS__)) {
       if (c == 0x1B) {
-        const auto *p = src + src_offset;
-        const auto *end = (len > 0) ? src + len : nullptr;
+        const auto* p = src + src_offset;
+        const auto* end = (len > 0) ? src + len : nullptr;
         if (p != end && *p == '[') {
           p++;
           // we don't check validity here, just assume valid code
@@ -514,26 +608,29 @@ size_t u8_width(const char *src, int len) {
   return total;
 }
 
-std::vector<std::string_view> u8_egc_split(const char *src, int32_t slen) {
+std::vector<std::string_view> u8_egc_split(const char* src, int32_t slen) {
   std::vector<std::string_view> result;
-  result.reserve(16);
+  if (slen <= 0) return result;
 
   EGCSmartIterator iter(src, slen);
   if (!iter.ok()) return result;
 
-  iter->first();
-  auto start = iter->current();
-  while (iter->next() != icu::BreakIterator::DONE) {
-    auto size = iter->current() - start;
-    result.emplace_back(src + start, size);
-    start = iter->current();
+  // Walk via EGCSmartIterator, not operator->(): the latter ensure_icu()'s
+  // the whole string, so explode(s, "") on ASCII paid a BreakIterator walk
+  // of every byte. first()/next() are arithmetic on the ASCII path.
+  result.reserve(iter.is_ascii() ? static_cast<size_t>(slen) : 16);
+  int32_t start = iter.first();
+  int32_t cur;
+  while ((cur = iter.next()) != icu::BreakIterator::DONE) {
+    result.emplace_back(src + start, cur - start);
+    start = cur;
   }
 
   return result;
 }
 
 // Return empty string if error or invalid translator.
-std::string u8_convert_encoding(UConverter *trans, const char *data, int len) {
+std::string u8_convert_encoding(UConverter* trans, const char* data, int len) {
   std::string result;
 
   if (trans) {
@@ -552,4 +649,116 @@ std::string u8_convert_encoding(UConverter *trans, const char *data, int len) {
     }
   }
   return result;
+}
+
+namespace {
+
+std::unordered_set<UChar32> u8_charset_set(const std::string& chars) {
+  std::unordered_set<UChar32> set;
+  const auto* s = reinterpret_cast<const uint8_t*>(chars.data());
+  int32_t i = 0;
+  const int32_t len = static_cast<int32_t>(chars.size());
+  while (i < len) {
+    UChar32 c;
+    U8_NEXT(s, i, len, c);
+    if (c < 0) {
+      c = 0xfffd;
+    }
+    set.insert(c);
+  }
+  return set;
+}
+
+int32_t u8_ltrim_off(const uint8_t* s, int32_t len, const std::unordered_set<UChar32>& set) {
+  int32_t i = 0;
+  while (i < len) {
+    int32_t prev = i;
+    UChar32 c;
+    U8_NEXT(s, i, len, c);
+    if (c < 0 || set.find(c) == set.end()) {
+      return prev;
+    }
+  }
+  return len;
+}
+
+int32_t u8_rtrim_off(const uint8_t* s, int32_t start, int32_t end,
+                     const std::unordered_set<UChar32>& set) {
+  int32_t i = end;
+  while (i > start) {
+    int32_t prev = i;
+    UChar32 c;
+    U8_PREV(s, start, i, c);
+    if (c < 0 || set.find(c) == set.end()) {
+      return prev;
+    }
+  }
+  return start;
+}
+
+}  // namespace
+
+// Trim by Unicode scalar value. The charset is a set of code points, so a
+// multi-byte character cannot donate individual UTF-8 bytes to the match
+// (U+3000 / 《 share E3 80 under find_first_not_of -- issue #1401).
+std::string ltrim(const std::string& str, const std::string& chars) {
+  if (str.empty()) {
+    return str;
+  }
+  const auto set = u8_charset_set(chars);
+  const auto* s = reinterpret_cast<const uint8_t*>(str.data());
+  const int32_t len = static_cast<int32_t>(str.size());
+  const int32_t off = u8_ltrim_off(s, len, set);
+  if (off == 0) {
+    return str;
+  }
+  return str.substr(static_cast<size_t>(off));
+}
+
+std::string rtrim(const std::string& str, const std::string& chars) {
+  if (str.empty()) {
+    return str;
+  }
+  const auto set = u8_charset_set(chars);
+  const auto* s = reinterpret_cast<const uint8_t*>(str.data());
+  const int32_t len = static_cast<int32_t>(str.size());
+  const int32_t end = u8_rtrim_off(s, 0, len, set);
+  if (end == len) {
+    return str;
+  }
+  return str.substr(0, static_cast<size_t>(end));
+}
+
+std::string trim(const std::string& str, const std::string& chars) {
+  if (str.empty()) {
+    return str;
+  }
+  const auto set = u8_charset_set(chars);
+  const auto* s = reinterpret_cast<const uint8_t*>(str.data());
+  const int32_t len = static_cast<int32_t>(str.size());
+  const int32_t start = u8_ltrim_off(s, len, set);
+  if (start == len) {
+    return {};
+  }
+  const int32_t end = u8_rtrim_off(s, start, len, set);
+  if (start == 0 && end == len) {
+    return str;
+  }
+  return str.substr(static_cast<size_t>(start), static_cast<size_t>(end - start));
+}
+
+// See the declaration in strutils.h. The scan itself is EGCIterator's
+// (all_ascii); this only adds the per-string memoization, which is what
+// makes a repeated sizeof() on the same string O(1) instead of O(n).
+bool u8_string_is_ascii_cached(const char* str, int32_t len, bool counted) {
+  if (!counted) {  // no block header to memoize into
+    return EGCIterator::scan_is_ascii(str, len);
+  }
+  unsigned char cached = MSTR_ASCII(str);
+  if (cached != MSTR_ASCII_UNKNOWN) {
+    return cached == MSTR_ASCII_YES;
+  }
+  bool ascii = EGCIterator::scan_is_ascii(str, len);
+  MSTR_ASCII(str) = ascii ? MSTR_ASCII_YES : MSTR_ASCII_NO;
+  return ascii;
 }

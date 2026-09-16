@@ -1,5 +1,4 @@
 ---
-layout: doc
 title: objects / destruct
 ---
 # destruct
@@ -23,5 +22,5 @@ title: objects / destruct
 
 ### SEE ALSO
 
-    clone_object(3), new(3), destruct_env_of(4), move(4)
+    clone_object(3), new(3)
 

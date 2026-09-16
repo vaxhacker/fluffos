@@ -8,6 +8,11 @@
 
 #include "net/ws_ascii.h"
 #include "net/ws_telnet.h"
+#include "net/tls.h"
+
+#include <openssl/ssl.h>
+
+#include <cstdio>
 
 enum PROTOCOL_ID {
   WS_HTTP = 0,
@@ -19,7 +24,7 @@ static struct lws_protocols protocols[] = {
     {"http", lws_callback_http_dummy, 0, 0, WS_HTTP},
     {"ascii", ws_ascii_callback, sizeof(struct ws_ascii_session), 4096, WS_ASCII},
     {"telnet", ws_telnet_callback, sizeof(struct ws_telnet_session), 4096, WS_TELNET},
-    //for backward compatiblity with fluffos 2.x
+    // for backward compatiblity with fluffos 2.x
     {"binary", ws_telnet_callback, sizeof(struct ws_telnet_session), 4096, WS_TELNET},
     {NULL, NULL, 0, 0} /* terminator */
 };
@@ -31,28 +36,48 @@ static const struct lws_extension extensions[] = {
      "; client_max_window_bits"},
     {NULL, NULL, NULL /* terminator */}};
 
-// modified on create.
-static struct lws_http_mount mount = {
-    /* .mount_next */ nullptr, /* linked-list "next" */
-    /* .mountpoint */ "/",     /* mountpoint URL */
-    /* .origin */ nullptr,     /* serve from dir */
-    /* .def */ "index.html",   /* default filename */
-    /* .protocol */ nullptr,
-    /* .cgienv */ nullptr,
-    /* .extra_mimetypes */ nullptr,
-    /* .interpret */ nullptr,
-    /* .cgi_timeout */ 0,
-    /* .cache_max_age */ 0,
-    /* .auth_mask */ 0,
-    /* .cache_reusable */ 0,
-    /* .cache_revalidate */ 0,
-    /* .cache_intermediaries */ 0,
-    /* .origin_protocol */ LWSMPRO_FILE, /* files in a dir */
-    /* .mountpoint_len */ 1,             /* char count */
-    /* .basic_auth_login_file */ nullptr,
-};
+// Field-by-field init (not positional aggregate init): lws has inserted new
+// members mid-struct across releases, which silently shifts positional
+// initializers. Remaining fields are zero/nullptr; origin is set on create.
+static struct lws_http_mount init_mount() {
+  struct lws_http_mount m = {};
+  m.mountpoint = "/";            /* mountpoint URL */
+  m.def = "index.html";          /* default filename */
+  m.origin_protocol = LWSMPRO_FILE; /* files in a dir */
+  m.mountpoint_len = 1;          /* char count */
+  return m;
+}
+static struct lws_http_mount mount = init_mount();
 
-void lws_log(int severity, const char *msg) {
+static const char* k_ws_ciphers =
+    "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:"
+    "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-"
+    "RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384";
+
+// lws_tls_cert_updated() and SSL_CTX_use_certificate_chain_file() on the
+// live vhost CTX both report success while new wss clients still see the
+// boot leaf (OpenSSL 3 + CONTEXT_PORT_NO_LISTEN_SERVER). A new vhost
+// loads the on-disk chain the same way boot does; new adoptions go there
+// and existing sessions stay on the vhost they already handshook.
+static void fill_ws_tls_info(struct lws_context_creation_info* info, port_def_t* port) {
+  info->options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+  info->options |= LWS_SERVER_OPTION_ALLOW_NON_SSL_ON_SSL_PORT;
+  info->options |= LWS_SERVER_OPTION_REDIRECT_HTTP_TO_HTTPS;
+  info->ssl_cipher_list = k_ws_ciphers;
+  info->ssl_cert_filepath = port->tls_cert.c_str();
+  info->ssl_private_key_filepath = port->tls_key.c_str();
+  info->ssl_options_clear = SSL_OP_CIPHER_SERVER_PREFERENCE;
+  info->ssl_options_set = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3;
+}
+
+static const char* current_ws_vhost_name(port_def_t* port) {
+  if (port && !port->lws_vhost_name.empty()) {
+    return port->lws_vhost_name.c_str();
+  }
+  return "default";
+}
+
+void lws_log(int severity, const char* msg) {
   if (severity == LLL_ERR) {
     debug(all, "lws ERROR: %s", msg);
   } else {
@@ -60,7 +85,7 @@ void lws_log(int severity, const char *msg) {
   }
 }
 
-struct lws_context *init_websocket_context(event_base *base, port_def_t *port) {
+struct lws_context* init_websocket_context(event_base* base, port_def_t* port) {
   int logs = LLL_USER | LLL_WARN | LLL_ERR;
 
 #ifdef DEBUG
@@ -73,7 +98,7 @@ struct lws_context *init_websocket_context(event_base *base, port_def_t *port) {
   lws_set_log_level(logs, lws_log);
 
   struct lws_context_creation_info info = {0};
-  void *foreign_loops[1] = {base};
+  void* foreign_loops[1] = {base};
 
   info.foreign_loops = foreign_loops;
 
@@ -88,20 +113,10 @@ struct lws_context *init_websocket_context(event_base *base, port_def_t *port) {
   info.options = LWS_SERVER_OPTION_LIBEVENT | LWS_SERVER_OPTION_VALIDATE_UTF8;
 
   if (!port->tls_cert.empty() && !port->tls_key.empty()) {
-    info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
-    info.options |= LWS_SERVER_OPTION_ALLOW_NON_SSL_ON_SSL_PORT;
-    info.options |= LWS_SERVER_OPTION_REDIRECT_HTTP_TO_HTTPS;
-    info.ssl_cipher_list =
-        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:"
-        "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-"
-        "RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384";
-    info.ssl_cert_filepath = port->tls_cert.c_str();
-    info.ssl_private_key_filepath = port->tls_key.c_str();
-    info.ssl_options_clear = SSL_OP_CIPHER_SERVER_PREFERENCE;
-    info.ssl_options_set = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3;
+    fill_ws_tls_info(&info, port);
   }
   // info.options |= LWS_SERVER_OPTION_HTTP_HEADERS_SECURITY_BEST_PRACTICES_ENFORCE;
-  info.user = (void *)port;
+  info.user = (void*)port;
 
   auto context = lws_create_context(&info);
 
@@ -110,8 +125,11 @@ struct lws_context *init_websocket_context(event_base *base, port_def_t *port) {
     return nullptr;
   }
 
+  port->lws_vhost_name = "default";
+  port->lws_tls_generation = 0;
+
   std::string res;
-  for (auto &p : protocols) {
+  for (auto& p : protocols) {
     if (p.name) {
       res += p.name;
       res += " ";
@@ -122,11 +140,20 @@ struct lws_context *init_websocket_context(event_base *base, port_def_t *port) {
   return context;
 }
 
-struct lws *init_user_websocket(struct lws_context *context, evutil_socket_t fd) {
-  return lws_adopt_socket(context, fd);
+struct lws* init_user_websocket(struct lws_context* context, evutil_socket_t fd) {
+  // Since lws v4.3 the context's vhost list is headed by an internal "system"
+  // vhost, which carries none of our ws protocols; lws_adopt_socket() adopts
+  // onto the list head, so adopt explicitly onto our own vhost instead.
+  auto* port = static_cast<port_def_t*>(lws_context_user(context));
+  auto* vhost = lws_get_vhost_by_name(context, current_ws_vhost_name(port));
+  if (!vhost) {
+    return nullptr;
+  }
+  return lws_adopt_socket_vhost(vhost, fd);
 }
 
-void websocket_send_text(struct lws *wsi, const char *data, size_t len) {
+void websocket_send_text(struct lws* wsi, const char* data, size_t len) {
+  inet_volume += len;
   switch (lws_get_protocol(wsi)->id) {
     case WS_TELNET:
       ws_telnet_send(wsi, data, len);
@@ -140,29 +167,66 @@ void websocket_send_text(struct lws *wsi, const char *data, size_t len) {
   }
 }
 
-void close_websocket_context(struct lws_context *context) { lws_context_destroy(context); }
+void close_websocket_context(struct lws_context* context) {
+  if (auto* port = static_cast<port_def_t*>(lws_context_user(context))) {
+    port->lws_vhost_name.clear();
+    port->lws_tls_generation = 0;
+  }
+  lws_context_destroy(context);
+}
 
-void close_user_websocket(struct lws *wsi) {
-  lws_set_timeout(wsi, pending_timeout::PENDING_FLUSH_STORED_SEND_BEFORE_CLOSE, LWS_TO_KILL_ASYNC);
+int reload_websocket_tls(port_def_t* port) {
+  if (!port || !port->lws_context || port->tls_cert.empty() || port->tls_key.empty()) {
+    return 1;
+  }
+
+  // Same loader as the telnet path so a missing/corrupt PEM errors to LPC
+  // before we create a live vhost.
+  SSL_CTX* probe = tls_server_init(port->tls_cert, port->tls_key);
+  if (!probe) {
+    return 2;
+  }
+  tls_server_close(probe);
+
+  char name[32];
+  snprintf(name, sizeof(name), "tls-%d", port->lws_tls_generation + 1);
+
+  struct lws_context_creation_info info = {0};
+  info.vhost_name = name;
+  info.port = CONTEXT_PORT_NO_LISTEN_SERVER;
+  info.protocols = protocols;
+  info.extensions = extensions;
+  info.mounts = &mount;
+  info.options = LWS_SERVER_OPTION_VALIDATE_UTF8;
+  fill_ws_tls_info(&info, port);
+
+  struct lws_vhost* vh = lws_create_vhost(port->lws_context, &info);
+  if (!vh) {
+    return 2;
+  }
+
+  port->lws_tls_generation++;
+  port->lws_vhost_name = name;
+  return 0;
+}
+
+void close_user_websocket(struct lws* wsi) {
+  bool close_from_writable = false;
   switch (lws_get_protocol(wsi)->id) {
     case WS_TELNET: {
-      auto pss = reinterpret_cast<ws_telnet_session *>(lws_wsi_user(wsi));
+      auto pss = reinterpret_cast<ws_telnet_session*>(lws_wsi_user(wsi));
       if (pss) {
-        if (evbuffer_get_length(pss->buffer) > 0) {
-          // try flush before closing.
-          lws_callback_on_writable(wsi);
-        }
+        pss->close_after_flush = true;
+        close_from_writable = true;
         pss->user = nullptr;
       }
       break;
     }
     case WS_ASCII: {
-      auto pss = reinterpret_cast<ws_ascii_session *>(lws_wsi_user(wsi));
+      auto pss = reinterpret_cast<ws_ascii_session*>(lws_wsi_user(wsi));
       if (pss) {
-        if (evbuffer_get_length(pss->buffer) > 0) {
-          // try flush before closing.
-          lws_callback_on_writable(wsi);
-        }
+        pss->close_after_flush = true;
+        close_from_writable = true;
         pss->user = nullptr;
       }
       break;
@@ -170,4 +234,26 @@ void close_user_websocket(struct lws *wsi) {
     default:
       break;
   }
+
+  if (close_from_writable) {
+    // The application-side evbuffer is outside lws, so an async kill can win
+    // before the requested writable callback moves these final bytes into lws.
+    // Give the application buffer a bounded drain; the protocol callback closes
+    // as soon as it is empty, while this timeout covers a permanently choked peer.
+    //
+    // The session is also done READING: input that arrives during the drain
+    // window is discarded by the protocol callbacks' nulled-pss->user guards
+    // (LWS_CALLBACK_RECEIVE breaks instead of hard-closing, which would
+    // truncate the very output this drain exists to flush). Note that
+    // lws_rx_flow_control() is NOT the way to express that here: with the
+    // libevent event lib, flipping POLLIN on a live wsi desyncs the fd
+    // watcher and starves POLLOUT, stalling the drain until the deadline
+    // kills it.
+    lws_set_timeout(wsi, pending_timeout::PENDING_FLUSH_STORED_SEND_BEFORE_CLOSE, 5);
+    lws_callback_on_writable(wsi);
+    return;
+  }
+
+  lws_set_timeout(wsi, pending_timeout::PENDING_FLUSH_STORED_SEND_BEFORE_CLOSE,
+                  LWS_TO_KILL_ASYNC);
 }

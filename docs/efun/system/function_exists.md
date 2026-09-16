@@ -1,5 +1,4 @@
 ---
-layout: doc
 title: system / function_exists
 ---
 # function_exists
@@ -9,9 +8,10 @@ title: system / function_exists
     function_exists()  -  find  the  file containing a given function in an
     object
 
-### SYNOPSYS
+### SYNOPSIS
 
     string function_exists( string str, object ob );
+    string function_exists( string str, object ob, int flag );
 
 ### DESCRIPTION
 
@@ -20,6 +20,11 @@ title: system / function_exists
     the function is defined by an inherited object.
 
     0 is returned if the function was not defined.
+
+    By default, functions that cannot be called from outside the object
+    (protected and private functions) are treated as not defined. If
+    'flag' is specified and is nonzero, such functions are reported as
+    well.
 
     Note that function_exists() does not check shadows.
 

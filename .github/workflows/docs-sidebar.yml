@@ -1,0 +1,39 @@
+name: Docs Sidebar
+
+# Verifies that docs/sidebars.generated.json is regenerated whenever pages in
+# the reference doc trees (efun/, apply/, stdlib/, concepts/, driver/, cli/,
+# zh-CN/) are added, removed, or moved. The sidebar is generated from the
+# directory trees + docs/sidebar_meta.json by docs/gen_sidebar.py; if a
+# contributor changes the trees without re-running the generator, this job
+# fails and tells them what to run.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'docs/**'
+  pull_request:
+    paths:
+      - 'docs/**'
+
+# Supersede an in-flight run when the same ref is pushed again. Without this
+# every push starts a full matrix and none of the older ones ever stop, so a
+# branch pushed a few times in quick succession has several complete runs
+# competing for the same runners and starving each other -- which looks
+# exactly like a CI outage. The default branch is exempt: master runs are the
+# release record and each commit's result is worth keeping.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  check:
+    name: sidebars.generated.json is up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Verify generated sidebar
+        run: python3 docs/gen_sidebar.py --check

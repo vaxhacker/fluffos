@@ -26,7 +26,7 @@ operator loop_cond_local, loop_cond_number;
 operator loop_incr;
 operator while_dec;
 
-operator lor, land;
+operator lor, land, nullish;
 
 operator catch, end_catch;
 operator time_expression, end_time_expression;
@@ -49,6 +49,9 @@ operator local, local_lvalue;
 operator ref, ref_lvalue;
 operator global, global_lvalue;
 operator member, member_lvalue;
+operator map_member, map_member_lvalue;
+operator map_member_optional;
+operator map_index_optional;
 operator index, index_lvalue;
 operator rindex, rindex_lvalue;
 operator nn_range, nn_range_lvalue, rn_range, rn_range_lvalue;
@@ -59,10 +62,19 @@ operator ne_range, re_range;
 operator add_eq, sub_eq, and_eq, or_eq, xor_eq, lsh_eq, rsh_eq, mult_eq;
 operator div_eq, mod_eq, assign;
 
+operator lor_eq, land_eq, nullish_eq, assign_value;
+
 operator void_add_eq, void_assign, void_assign_local;
+
+/* Specialized plain-slot stores (issue #1358). Appended so the
+ * F_ADD_EQ..F_ASSIGN range used by lvalue conversion stays intact.
+ * Bytecode is not persisted; adding operators only shifts efun numbers. */
+operator assign_local, assign_global, void_assign_global;
 
 operator add, subtract, multiply, divide, mod, and, or, xor, lsh, rsh;
 operator not, negate, compl;
+
+operator template_coerce;
 
 operator function_constructor;
 operator simul_efun;
@@ -73,3 +85,22 @@ operator parse_command;
 operator new_class, new_empty_class;
 operator expand_varargs;
 operator type_check;
+
+/* async/await (issue #1319). Appended rather than inserted, but be clear
+ * about what that does and does not buy: the operators in this file are
+ * numbered BEFORE the efuns, so adding three here still shifts every efun
+ * opcode up by three (F_TRIM is 134 on this branch). Appending only keeps
+ * the other OPERATORS stable.
+ *
+ * That is safe here because nothing persists bytecode -- programs are
+ * compiled from source at load and never serialised, "swapping" in
+ * backend.cc is reset/clean_up only, and instrs[], the interpreter and the
+ * disassembler are all generated together from these files. It would stop
+ * being safe the day anything caches compiled programs across runs.
+ *
+ * It did push opcodes past 127, which is exactly the AGENTS.md section
+ * 13.17 boundary: the disassembler's `*pc` fetch sign-extended them and
+ * silently dropped every high opcode until it was changed to
+ * EXTRACT_UCHAR. */
+operator await;
+operator acatch, end_acatch;

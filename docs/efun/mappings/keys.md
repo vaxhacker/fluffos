@@ -1,5 +1,4 @@
 ---
-layout: doc
 title: mappings / keys
 ---
 # keys
@@ -33,5 +32,5 @@ title: mappings / keys
 
 ### SEE ALSO
 
-    values(3), each(3)
+    values(3), for
 

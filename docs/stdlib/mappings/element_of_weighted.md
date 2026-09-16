@@ -1,5 +1,4 @@
 ---
-layout: doc
 title: stdlib / element_of_weighted
 ---
 # element_of_weighted
@@ -29,7 +28,7 @@ title: stdlib / element_of_weighted
 
 ```c
 mapping colors = ([ "red" : 50, "green" : 25, "blue" : 25 ]);
-string result = element_weighted( colors );
+string result = element_of_weighted( colors );
 // High chance of "red" being returned while lower, and equal chances
 // of green and blue being returned.
 ```

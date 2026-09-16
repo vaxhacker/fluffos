@@ -1,0 +1,752 @@
+#!/usr/bin/env node
+// ws-smoke.js -- end-to-end websocket smoke test against the NATIVE driver.
+//
+//   node tools/ws-smoke.js [driver] [testsuite-dir]
+//     driver        default build/src/driver (relative to the repo root)
+//     testsuite-dir default testsuite/
+//
+// Boots `driver etc/config.test`, then exercises the websocket transport
+// the way a real web client does -- something neither GTest nor the LPC
+// suite touches (see src/www/AGENTS.md):
+//
+//   * HTTP GET on the ws port (the `websocket http dir` mount serves
+//     src/www -- the shipped web client)
+//   * a `telnet`-subprotocol connection driven through the REAL shared
+//     browser telnet layer (src/www/telnet.js, eval'd into this script):
+//     negotiation, the WILL/WONT SGA char-mode switch around get_char(),
+//     and the /std/tui showcases
+//   * a deterministic 5000-byte output burst (more than two 2048-byte lws
+//     write windows) arriving completely -- a basic multi-window sanity
+//     check. The size is generated via eval(), not read off a tuidemo
+//     demo's actual output, so the check can't silently stop covering the
+//     >1-window case if the demo content changes (tuidemo charts, for the
+//     record, is only ~1.8KB -- comfortably under one window on its own)
+//   * a genuine backpressure test: pause the client's socket, then push a
+//     ~4.8MB burst -- enough to fill the kernel send buffer while the
+//     "reader" can't drain it -- and confirm the connection recovers once
+//     resumed. This is the actual regression test for the output wedge in
+//     src/net/ws_telnet.cc / ws_ascii.cc: lws_send_pipe_choked() reports
+//     the socket simply being full (zero-timeout poll) with no partial
+//     write pending, and in that case lws never re-arms the writeable
+//     callback on its own -- the drain loop must request it whenever it
+//     exits with data still queued, or output freezes for good. The
+//     quick 5000-byte burst above
+//     does NOT exercise this -- on a fast, unpaused reader the whole
+//     payload fits in the kernel's send buffer and no write ever blocks,
+//     so it passes identically on fixed and unfixed code. Only forced
+//     backpressure tells them apart.
+//   * a live full-screen TUI (`tuidemo dashboard`): alternate screen,
+//     sustained frame updates, clean quit
+//   * a driver-initiated close while the connection is choked (destruct
+//     the interactive mid-backpressure): all queued output must arrive
+//     before close, and teardown must release the session resources even
+//     though the driver side is already gone -- an interim revision leaked
+//     a pending session timer here, a use-after-free that aborted the driver
+//     on the ASan CI job. The client also SENDS input during the drain
+//     window: once a close is pending the driver must stop reading (input
+//     is discarded), because the LWS_CALLBACK_RECEIVE null-user guard used
+//     to hard-close the wsi, truncating the very flush the close waits for
+//   * an `ascii`-subprotocol connection with the same bursts and
+//     close-after-flush check, sent as TEXT frames (ws_ascii.cc rejects
+//     binary frames outright) through ws_ascii.cc's twin drain loop
+//   * a permessage-deflate connection (the only pmd coverage anywhere --
+//     browsers negotiate it, this hand-rolled client must opt in): a
+//     destruct right behind an incompressible burst, swept across sizes so
+//     the final 2048-byte drain window is guaranteed (at least once) to
+//     compress to more than pm-deflate's 1024-byte tx buffer and leave the
+//     extension mid-drain (tx_draining_ext) exactly when the application
+//     buffer empties. Closing at that instant makes lws discard the
+//     drain -- the compressed tail of the final message, and the marker
+//     with it -- so the close must wait until lws_send_pipe_choked()
+//     clears. Chromium speaks h1+pmd, Firefox h2+pmd; a test matrix
+//     without pmd has shipped "works in the test client, dies in the
+//     browser" bugs twice before (see src/www/AGENTS.md)
+//   * a TLS (`wss`) telnet connection: banner, then the same forced
+//     backpressure through the TLS partial-write path, then a real
+//     cert swap: overwrite the on-disk cert/key with a newly generated
+//     pair, sys_reload_tls() on the live wss port, and assert the next
+//     handshake presents the NEW fingerprint (issue #1395 -- the efun
+//     used to refuse websocket ports; reloading the same files is not
+//     enough to prove the vhost SSL_CTX was replaced)
+//
+// No npm dependencies: the websocket client (handshake + framing) is
+// implemented on net/tls sockets below. Exit code 0 = all checks passed.
+
+'use strict';
+
+const net = require('net');
+const tls = require('tls');
+const zlib = require('zlib');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const http = require('http');
+const os = require('os');
+const { spawn, spawnSync, execFileSync } = require('child_process');
+
+const repoRoot = path.resolve(__dirname, '..');
+const driverPath = path.resolve(process.argv[2] || path.join(repoRoot, 'build/src/driver'));
+const suiteDir = path.resolve(process.argv[3] || path.join(repoRoot, 'testsuite'));
+const configRel = 'etc/config.test';
+
+// The browser telnet client, shared verbatim with the web pages.
+// (classic script, no module exports -- evaluate and take the binding)
+const TelnetClient = eval(
+  fs.readFileSync(path.join(repoRoot, 'src/www/telnet.js'), 'utf8') + '\n;TelnetClient');
+
+// ---- config -----------------------------------------------------------
+
+function wsPorts() {
+  const conf = fs.readFileSync(path.join(suiteDir, configRel), 'utf8');
+  const ports = [];
+  let tlsIndex = 0;
+  let tlsPort;
+  for (const m of conf.matchAll(/^external_port_(\d+)\s*:\s*websocket\s+(\d+)/gm)) {
+    const index = parseInt(m[1], 10);
+    const port = parseInt(m[2], 10);
+    ports.push(port);
+    if (new RegExp('^external_port_' + index + '_tls\\s*:', 'm').test(conf)) {
+      tlsIndex = index;
+      tlsPort = port;
+    }
+  }
+  if (ports.length < 1) throw new Error('no websocket ports in ' + configRel);
+  return { plain: ports[0], tlsPort, tlsIndex };  // config.test: 4001, 4002 (TLS, index 3)
+}
+
+function tlsFilePaths() {
+  const conf = fs.readFileSync(path.join(suiteDir, configRel), 'utf8');
+  const m = conf.match(/^external_port_\d+_tls\s*:\s*cert=(\S+)\s+key=(\S+)/m);
+  if (!m) throw new Error('no external_port_N_tls cert=/key= in ' + configRel);
+  return {
+    cert: path.resolve(suiteDir, m[1]),
+    key: path.resolve(suiteDir, m[2]),
+  };
+}
+
+function opensslPeerCert(port) {
+  const sclient = spawnSync('openssl', [
+    's_client', '-connect', `127.0.0.1:${port}`,
+  ], { input: '', encoding: 'utf8', maxBuffer: 1024 * 1024 });
+  const x509 = spawnSync('openssl', [
+    'x509', '-noout', '-subject', '-fingerprint', '-sha256',
+  ], { input: sclient.stdout, encoding: 'utf8' });
+  if (x509.status !== 0 || !x509.stdout.trim()) {
+    throw new Error(
+      'openssl could not read the peer cert on port ' + port + ': ' +
+      ((x509.stderr || sclient.stderr || '').toString().slice(-400)));
+  }
+  return x509.stdout.trim();
+}
+
+function writeFreshSelfSigned(certPath, keyPath) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fluffos-ws-cert-'));
+  const newCert = path.join(tmp, 'cert.pem');
+  const newKey = path.join(tmp, 'key.pem');
+  execFileSync('openssl', [
+    'req', '-x509', '-newkey', 'rsa:2048', '-sha256',
+    '-keyout', newKey, '-out', newCert,
+    '-days', '2', '-nodes',
+    '-subj', '/CN=fluffos-ws-reload-1395',
+  ], { stdio: 'pipe' });
+  fs.copyFileSync(newCert, certPath);
+  fs.copyFileSync(newKey, keyPath);
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// A deterministic multi-window burst: 5000 'x' bytes (more than two
+// 2048-byte lws write windows) + a marker written last, so a truncated
+// burst is unambiguous. Verified directly against both ws subprotocols
+// (see the driver-side trace this test guards: a single writable
+// callback draining 5024 bytes across 2048+2048+928-byte iterations).
+const BURST_CMD = 'eval write(repeat_string("x", 5000) + "|END|"); return "done"';
+
+// A ~4.8MB burst, looped because a single repeat_string() is capped by the
+// "maximum string length" config (200000 in config.test) -- one call over
+// that limit errors instead of producing a giant string, which silently
+// degrades this into a no-op check (the error message is tiny and arrives
+// instantly, so a paused/dead reader looks identical to a real freeze).
+const BACKPRESSURE_BURST_CMD =
+  'eval for (int i=0;i<600;i++) write(repeat_string("x", 8000)); write("|END|"); return "done"';
+
+// Keep the marker split in the source so the echoed command cannot satisfy
+// the close-flush assertion. The output is intentionally large enough to
+// leave the application-side websocket buffer choked when the interactive
+// is destructed.
+const CLOSE_BACKPRESSURE_BURST_CMD =
+  'eval for (int i=0;i<600;i++) write(repeat_string("x", 8000)); ' +
+  'write("|CLOSE-" + "FLUSH|"); return "done"';
+
+const CLOSE_TIMEOUT_BURST_CMD =
+  'eval for (int i=0;i<600;i++) write(repeat_string("x", 8000)); ' +
+  'write("|TIMEOUT-" + "CLOSE|"); return "done"';
+
+// ---- tiny websocket client (RFC6455 client side, no deps) ---------------
+
+class WSClient {
+  constructor(socket, host, port, subprotocol, offerPmd) {
+    this.sock = socket;
+    this.buf = Buffer.alloc(0);
+    // Frames can arrive (and be parsed) before the caller has a chance to
+    // assign onFrame -- the upgrade response and the first data frame(s)
+    // often land in the same TCP segment on localhost. Queue anything that
+    // shows up before a real handler is attached instead of dropping it
+    // through a no-op default.
+    this._onFrame = null;
+    this._pending = [];
+    this.onClose = () => {};
+    this.closeCode = null;
+    this.established = false;
+    this.negotiated = null;
+    this.pmdActive = false;
+    if (offerPmd) {
+      // One persistent raw inflater for the whole connection: RFC 7692
+      // messages are one continuous raw-deflate stream (each message ends
+      // with an elided 00 00 ff ff sync flush), which decodes identically
+      // whether or not the server resets its compression context between
+      // messages -- a reset just means later blocks never reference earlier
+      // history.
+      this._inflater = zlib.createInflateRaw();
+      this._inflater.on('data', (d) => this._deliver(d));
+      // A truncated final message (the very bug the pmd scenario guards)
+      // may leave the stream mid-block; surface that as missing output,
+      // not an unhandled 'error' crash.
+      this._inflater.on('error', () => {});
+      this._msgCompressed = false;
+    }
+    const key = crypto.randomBytes(16).toString('base64');
+    this.acceptWant = crypto.createHash('sha1')
+      .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+    socket.write(
+      `GET / HTTP/1.1\r\nHost: ${host}:${port}\r\nUpgrade: websocket\r\n` +
+      `Connection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\n` +
+      `Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: ${subprotocol}\r\n` +
+      (offerPmd ? 'Sec-WebSocket-Extensions: permessage-deflate\r\n' : '') +
+      '\r\n');
+    socket.on('data', (d) => this.feed(d));
+    socket.on('close', () => this.onClose());
+    socket.on('error', () => this.onClose());
+  }
+
+  _deliver(payload) {
+    if (this._onFrame) this._onFrame(payload);
+    else this._pending.push(payload);
+  }
+
+  feed(d) {
+    this.buf = Buffer.concat([this.buf, d]);
+    if (!this.established) {
+      const end = this.buf.indexOf('\r\n\r\n');
+      if (end === -1) return;
+      const head = this.buf.slice(0, end).toString('latin1');
+      this.buf = this.buf.slice(end + 4);
+      if (!/HTTP\/1\.1 101/.test(head)) throw new Error('upgrade refused:\n' + head);
+      const accept = /sec-websocket-accept:\s*(\S+)/i.exec(head);
+      if (!accept || accept[1] !== this.acceptWant) throw new Error('bad Sec-WebSocket-Accept');
+      const proto = /sec-websocket-protocol:\s*(\S+)/i.exec(head);
+      this.negotiated = proto ? proto[1] : null;
+      this.pmdActive = /sec-websocket-extensions:.*permessage-deflate/i.test(head);
+      this.established = true;
+    }
+    // frames
+    for (;;) {
+      if (this.buf.length < 2) return;
+      const b0 = this.buf[0], b1 = this.buf[1];
+      const fin = !!(b0 & 0x80);
+      const rsv1 = !!(b0 & 0x40);
+      const opcode = b0 & 0x0f;
+      let len = b1 & 0x7f, off = 2;
+      if (len === 126) {
+        if (this.buf.length < 4) return;
+        len = this.buf.readUInt16BE(2); off = 4;
+      } else if (len === 127) {
+        if (this.buf.length < 10) return;
+        len = Number(this.buf.readBigUInt64BE(2)); off = 10;
+      }
+      if (b1 & 0x80) off += 4;  // masked server frame (never, but be safe)
+      if (this.buf.length < off + len) return;
+      const payload = this.buf.slice(off, off + len);
+      this.buf = this.buf.slice(off + len);
+      if (opcode === 0x9) { this.sendFrame(0xA, payload); continue; }  // ping -> pong
+      if (opcode === 0x8) {
+        this.closeCode = payload.length >= 2 ? payload.readUInt16BE(0) : 1005;
+        this.sock.destroy();
+        this.onClose();
+        return;
+      }
+      if (opcode === 0x1 || opcode === 0x2 || opcode === 0x0) {
+        if (this.pmdActive) {
+          // RSV1 marks a compressed message on its FIRST frame only; the
+          // extension tx-drain path splits one message across continuation
+          // frames, which are just further slices of the deflate stream.
+          if (opcode !== 0x0) this._msgCompressed = rsv1;
+          if (this._msgCompressed) {
+            this._inflater.write(payload);
+            // Each complete message elides a trailing 00 00 ff ff sync
+            // flush (RFC 7692 7.2.1); restore it so the inflater emits
+            // everything up to the message boundary.
+            if (fin) this._inflater.write(Buffer.from([0x00, 0x00, 0xff, 0xff]));
+          } else {
+            this._deliver(payload);
+          }
+        } else {
+          this._deliver(payload);
+        }
+      }
+    }
+  }
+
+  get onFrame() { return this._onFrame; }
+  set onFrame(fn) {
+    this._onFrame = fn;
+    if (fn && this._pending.length) {
+      const q = this._pending;
+      this._pending = [];
+      for (const payload of q) fn(payload);
+    }
+  }
+
+  sendFrame(opcode, payload) {
+    const mask = crypto.randomBytes(4);
+    let head;
+    if (payload.length < 126) {
+      head = Buffer.from([0x80 | opcode, 0x80 | payload.length]);
+    } else if (payload.length < 65536) {
+      head = Buffer.alloc(4);
+      head[0] = 0x80 | opcode; head[1] = 0x80 | 126;
+      head.writeUInt16BE(payload.length, 2);
+    } else {
+      throw new Error('frame too large for this test client');
+    }
+    const masked = Buffer.from(payload);
+    for (let i = 0; i < masked.length; i++) masked[i] ^= mask[i & 3];
+    this.sock.write(Buffer.concat([head, mask, masked]));
+  }
+
+  sendBinary(bytes) { this.sendFrame(0x2, Buffer.from(bytes)); }
+  // ws_ascii.cc rejects binary frames outright (lws_frame_is_binary() ->
+  // return -1, which closes the connection) -- the ascii subprotocol only
+  // accepts TEXT frames from the client.
+  sendText(str) { this.sendFrame(0x1, Buffer.from(str, 'utf8')); }
+  close() { try { this.sock.destroy(); } catch (_) {} }
+}
+
+function connectWS(port, subprotocol, useTls, offerPmd) {
+  return new Promise((resolve, reject) => {
+    const to = setTimeout(() => reject(new Error('ws connect timeout')), 15000);
+    const sock = useTls
+      ? tls.connect({
+          port,
+          host: '127.0.0.1',
+          rejectUnauthorized: false,
+          // Session resume reuses the previous peer cert and hides a
+          // live SSL_CTX rotation. Disable the client cache so the
+          // post-reload handshake must present whatever is on the CTX.
+          maxCachedSessions: 0,
+        }, onUp)
+      : net.connect(port, '127.0.0.1', onUp);
+    sock.on('error', (e) => { clearTimeout(to); reject(e); });
+    let ws;
+    function onUp() {
+      ws = new WSClient(sock, '127.0.0.1', port, subprotocol, offerPmd);
+      if (useTls) {
+        const cert = sock.getPeerCertificate();
+        ws.peerFingerprint = cert && (cert.fingerprint256 || cert.fingerprint);
+      }
+      const poll = setInterval(() => {
+        if (ws.established) {
+          clearInterval(poll); clearTimeout(to);
+          resolve(ws);
+        }
+      }, 20);
+    }
+  });
+}
+
+// ---- helpers ------------------------------------------------------------
+
+const results = [];
+function check(name, ok, detail) {
+  results.push({ name, ok });
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  -- ' + detail : ''}`);
+}
+
+function waitFor(fn, timeout, what) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (fn()) { clearInterval(iv); resolve(true); }
+      else if (Date.now() - t0 > timeout) { clearInterval(iv); resolve(false); }
+    }, 50);
+  });
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function httpGet(port, urlPath) {
+  return new Promise((resolve, reject) => {
+    http.get({ host: '127.0.0.1', port, path: urlPath }, (res) => {
+      let body = '';
+      res.on('data', (d) => { body += d; });
+      res.on('end', () => resolve({ status: res.statusCode, body }));
+    }).on('error', reject);
+  });
+}
+
+// A telnet-subprotocol session: the shared TelnetClient does negotiation,
+// we watch text/charmode and can push raw keystrokes.
+function telnetSession(ws) {
+  const s = { text: '', chunks: 0, charMode: false };
+  const telnet = new TelnetClient((bytes) => ws.sendBinary(bytes));
+  telnet.onText = (t) => { s.text += t; s.chunks++; };
+  telnet.onCharMode = (on) => { s.charMode = on; };
+  ws.onFrame = (payload) => telnet.receive(payload);
+  s.sendText = (str) => telnet.sendRaw(Array.from(Buffer.from(str, 'utf8')));
+  s.telnet = telnet;
+  return s;
+}
+
+// ---- the test -----------------------------------------------------------
+
+async function main() {
+  const { plain, tlsPort, tlsIndex } = wsPorts();
+
+  if (!fs.existsSync(driverPath)) {
+    console.error('driver not found: ' + driverPath);
+    process.exit(2);
+  }
+
+  console.log(`booting ${driverPath} ${configRel} (ws ports: ${plain}${tlsPort ? ', tls ' + tlsPort : ''})`);
+  const driver = spawn(driverPath, [configRel], { cwd: suiteDir, stdio: ['ignore', 'pipe', 'pipe'] });
+  let driverLog = '';
+  driver.stdout.on('data', (d) => { driverLog += d; });
+  driver.stderr.on('data', (d) => { driverLog += d; });
+  const kill = () => { try { driver.kill('SIGKILL'); } catch (_) {} };
+  process.on('exit', kill);
+
+  const up = await waitFor(() => driverLog.includes('Initializations complete'), 60000);
+  if (!up) {
+    console.error('driver did not boot; log tail:\n' + driverLog.slice(-2000));
+    process.exit(2);
+  }
+
+  // 1. the ws port's HTTP mount serves the web client
+  const page = await httpGet(plain, '/');
+  check('http mount serves the web client', page.status === 200 && page.body.includes('xterm'),
+        'status ' + page.status);
+  const xt = await httpGet(plain, '/vendor/xterm.js');
+  const tj = await httpGet(plain, '/telnet.js');
+  check('http mount serves vendor/ and telnet.js', xt.status === 200 && tj.status === 200);
+
+  // 2. telnet subprotocol: negotiation + banner through the REAL client
+  const ws = await connectWS(plain, 'telnet', false);
+  check('ws upgrade negotiates the telnet subprotocol', ws.negotiated === 'telnet');
+  const s = telnetSession(ws);
+  check('banner arrives', await waitFor(() => s.text.length > 50, 15000),
+        s.text.length + ' chars');
+
+  // 3. multi-window burst: basic sanity check that draining several
+  //    2048-byte lws write windows in one callback works and delivers
+  //    everything. A deterministic 5000-byte payload, via eval() so the
+  //    size doesn't silently drift if the tuidemo demos change. This does
+  //    NOT catch the lws wedge below -- see 3b.
+  s.text = '';
+  s.sendText(BURST_CMD + '\r\n');
+  const gotBurst = await waitFor(() => s.text.includes('|END|'), 15000);
+  check('multi-window burst arrives completely',
+        gotBurst && s.text.length > 4096, s.text.length + ' chars');
+
+  // 3b. genuine backpressure: pause the socket so the kernel send buffer
+  //     actually fills, push ~4.8MB, then resume and confirm recovery --
+  //     see BACKPRESSURE_BURST_CMD above for why the quick burst can't do
+  //     this. Pre-fix, the connection stays wedged after resume forever.
+  s.text = '';
+  ws.sock.pause();
+  s.sendText(BACKPRESSURE_BURST_CMD + '\r\n');
+  await sleep(1500);
+  ws.sock.resume();
+  const gotBackpressureBurst = await waitFor(() => s.text.includes('|END|'), 20000);
+  check('recovers from genuine backpressure (lws wedge regression)',
+        gotBackpressureBurst && s.text.length > 4700000, s.text.length + ' chars');
+
+  // 4. char mode: get_char() -> WILL SGA -> keystrokes -> quit -> WONT SGA
+  s.sendText('tuidemo\r\n');
+  check('readline arms char mode (WILL SGA)', await waitFor(() => s.charMode, 15000));
+  for (const ch of 'quit\r') s.sendText(ch);
+  check('quit returns to line mode (WONT SGA)', await waitFor(() => !s.charMode, 15000));
+
+  // 5. live full-screen TUI: alternate screen + sustained frames + clean quit
+  s.text = '';
+  s.sendText('tuidemo dashboard\r\n');
+  const altOn = await waitFor(() => s.text.includes('\x1b[?1049h'), 15000);
+  check('dashboard enters the alternate screen', altOn);
+  const chunksBefore = s.chunks;
+  await sleep(1500);
+  check('dashboard keeps streaming frames', s.chunks >= chunksBefore + 2,
+        `${s.chunks - chunksBefore} updates in 1.5s`);
+  s.sendText('q');
+  check('q quits (alt screen restored)',
+        await waitFor(() => s.text.includes('\x1b[?1049l'), 15000));
+  await waitFor(() => !s.charMode, 15000);
+  ws.close();
+
+  // 5b. driver-initiated close while choked: destruct the interactive while
+  //     its output is backpressured. The application-side evbuffer must drain
+  //     before lws closes, and LWS_CALLBACK_CLOSED must release the session
+  //     resources even though pss->user is already nulled. An interim
+  //     revision leaked a pending session timer on this path, a use-after-free
+  //     on the freed wsi/pss. On the ASan CI job such a bug aborts the driver
+  //     deterministically (the follow-up connection below then fails); plain
+  //     builds may survive it silently.
+  const wsD = await connectWS(plain, 'telnet', false);
+  const sd = telnetSession(wsD);
+  let destructClosed = false;
+  wsD.onClose = () => { destructClosed = true; };
+  await waitFor(() => sd.text.length > 50, 15000);
+  sd.text = '';
+  wsD.sock.pause();
+  sd.sendText(CLOSE_BACKPRESSURE_BURST_CMD + '\r\n');
+  await sleep(1000);
+  sd.sendText('eval destruct(this_player()); return "bye"\r\n');
+  await sleep(1000);
+  // The close is pending and the drain is choked; a real player often keeps
+  // typing at this point. The driver must stop reading and discard this --
+  // the RECEIVE null-user guard used to hard-close the wsi here, truncating
+  // the flush this whole scenario asserts on.
+  sd.sendText('look\r\n');
+  await sleep(200);
+  wsD.sock.resume();
+  const gotCloseFlush = await waitFor(
+    () => sd.text.includes('|CLOSE-FLUSH|'),
+    20000);
+  const gotDriverClose = await waitFor(() => destructClosed, 10000);
+  check('driver-initiated close flushes choked output before teardown',
+        gotCloseFlush && gotDriverClose && wsD.closeCode === 1000 &&
+          sd.text.length > 4700000,
+        `${sd.text.length} chars; closed ${gotDriverClose}; code ${wsD.closeCode}`);
+  wsD.close();
+
+  // A peer that remains choked cannot hold the driver-side session forever.
+  // Keep this socket paused beyond close_user_websocket()'s five-second
+  // application-buffer deadline. The final marker must remain behind the
+  // choked window and the connection must be gone when reads resume.
+  const wsTimeout = await connectWS(plain, 'telnet', false);
+  const timeoutSession = telnetSession(wsTimeout);
+  let timeoutClosed = false;
+  wsTimeout.onClose = () => { timeoutClosed = true; };
+  await waitFor(() => timeoutSession.text.length > 50, 15000);
+  timeoutSession.text = '';
+  wsTimeout.sock.pause();
+  timeoutSession.sendText(CLOSE_TIMEOUT_BURST_CMD + '\r\n');
+  await sleep(1000);
+  timeoutSession.sendText(
+    'eval destruct(this_player()); return "bye"\r\n');
+  // Comfortably past the deadline: the timer only starts once the driver
+  // PROCESSES the destruct, so a tight margin here can lose the race on a
+  // loaded CI runner (resume beats the kill and the full drain arrives).
+  await sleep(7000);
+  wsTimeout.sock.resume();
+  const gotBoundedClose = await waitFor(() => timeoutClosed, 10000);
+  check('driver bounds close flushing for a permanently choked peer',
+        gotBoundedClose &&
+          !timeoutSession.text.includes('|TIMEOUT-CLOSE|'),
+        `${timeoutSession.text.length} chars; closed ${gotBoundedClose}`);
+  wsTimeout.close();
+
+  const wsE = await connectWS(plain, 'telnet', false);
+  const se = telnetSession(wsE);
+  check('driver survives destruct-while-choked (teardown UAF regression)',
+        await waitFor(() => se.text.length > 50, 15000));
+  wsE.close();
+
+  // 6. ascii subprotocol: same big burst through ws_ascii.cc's drain loop.
+  //    ws_ascii.cc rejects binary frames outright (return -1 on
+  //    lws_frame_is_binary(), closing the connection) -- send TEXT frames.
+  const wsA = await connectWS(plain, 'ascii', false);
+  check('ascii subprotocol connects', wsA.negotiated === 'ascii');
+  let asciiText = '';
+  wsA.onFrame = (payload) => { asciiText += payload.toString('utf8'); };
+  await waitFor(() => asciiText.length > 50, 15000);
+  asciiText = '';
+  wsA.sendText(BURST_CMD + '\n');
+  const gotAscii = await waitFor(() => asciiText.includes('|END|'), 15000);
+  check('ascii: multi-window burst arrives completely',
+        gotAscii && asciiText.length > 4096, asciiText.length + ' chars');
+
+  asciiText = '';
+  wsA.sock.pause();
+  wsA.sendText(BACKPRESSURE_BURST_CMD + '\n');
+  await sleep(1500);
+  wsA.sock.resume();
+  const gotAsciiBackpressure = await waitFor(() => asciiText.includes('|END|'), 20000);
+  check('ascii: recovers from genuine backpressure (lws wedge regression)',
+        gotAsciiBackpressure && asciiText.length > 4700000, asciiText.length + ' chars');
+
+  asciiText = '';
+  let asciiDestructClosed = false;
+  wsA.onClose = () => { asciiDestructClosed = true; };
+  wsA.sock.pause();
+  wsA.sendText(CLOSE_BACKPRESSURE_BURST_CMD + '\n');
+  await sleep(1000);
+  wsA.sendText('eval destruct(this_player()); return "bye"\n');
+  await sleep(1000);
+  // Input during the pending-close drain must be discarded, not treated as
+  // a reason to hard-close -- see the telnet twin above.
+  wsA.sendText('look\n');
+  await sleep(200);
+  wsA.sock.resume();
+  const gotAsciiCloseFlush = await waitFor(
+    () => asciiText.includes('|CLOSE-FLUSH|'),
+    20000);
+  const gotAsciiDriverClose = await waitFor(
+    () => asciiDestructClosed,
+    10000);
+  check('ascii: driver-initiated close flushes choked output before teardown',
+        gotAsciiCloseFlush && gotAsciiDriverClose &&
+          wsA.closeCode === 1000 && asciiText.length > 4700000,
+        `${asciiText.length} chars; closed ${gotAsciiDriverClose}; code ${wsA.closeCode}`);
+  wsA.close();
+
+  // 6b. permessage-deflate close-after-flush: the destruct lands right
+  //     behind an incompressible burst, so the application buffer empties
+  //     while pm-deflate may still hold the compressed tail of the final
+  //     message (tx_draining_ext) -- lws's close path discards that drain,
+  //     so closing at that instant truncates the message. The drain only
+  //     triggers when a drained window's COMPRESSED size exceeds
+  //     pm-deflate's 1024-byte tx buffer, and the final window's size is
+  //     (total output) mod 2048 -- not directly controllable past the
+  //     banner/echo overhead. Sweep burst sizes spaced 375 apart across a
+  //     full 2048 ring: whatever the overhead, at least one attempt's final
+  //     window lands in the drain-triggering range (window width ~650 >
+  //     point spacing 375 after wraparound gap 548), making the sweep a
+  //     deterministic regression rather than an alignment lottery.
+  const pmdSizes = [3300, 3675, 4050, 4425, 4800, 5175];
+  const pmdFailures = [];
+  let pmdNegotiated = false;
+  for (const size of pmdSizes) {
+    const wsP = await connectWS(plain, 'telnet', false, true);
+    if (!wsP.pmdActive) {
+      wsP.close();
+      break;  // pmdNegotiated check below reports it
+    }
+    pmdNegotiated = true;
+    const sp = telnetSession(wsP);
+    let pmdClosed = false;
+    wsP.onClose = () => { pmdClosed = true; };
+    await waitFor(() => sp.text.length > 50, 15000);
+    sp.text = '';
+    // Incompressible payload (uniform random over 94 printable chars,
+    // ~6.55 bits/char, and pm-deflate runs at compression level 1), marker
+    // split so the echoed command can't satisfy the assertion, destruct in
+    // the same eval so the close races the drain of this very output.
+    sp.sendText(
+      `eval string s=""; for(int j=0;j<${size};j++) s+=sprintf("%c",33+random(94)); ` +
+      'write(s+"|PMD-"+"DONE|"); destruct(this_player()); return "bye"\r\n');
+    const pmdSawClose = await waitFor(() => pmdClosed, 15000);
+    const pmdSawMarker = await waitFor(() => sp.text.includes('|PMD-DONE|'), 3000);
+    if (!(pmdSawClose && pmdSawMarker && wsP.closeCode === 1000)) {
+      pmdFailures.push(
+        `size ${size}: ${sp.text.length} chars, marker ${pmdSawMarker}, ` +
+        `closed ${pmdSawClose}, code ${wsP.closeCode}`);
+    }
+    wsP.close();
+  }
+  check('pmd: upgrade negotiates permessage-deflate', pmdNegotiated);
+  check('pmd: driver-initiated close never truncates the extension tx drain',
+        pmdNegotiated && pmdFailures.length === 0,
+        pmdFailures.length ? pmdFailures.join(' | ') : `${pmdSizes.length} burst sizes clean`);
+
+  // 7. TLS websocket: banner, then forced backpressure through the TLS
+  //    write path (SSL partial writes retry differently --
+  //    LWS_SSL_CAPABLE_MORE_SERVICE -- than plain sockets, so exercise the
+  //    choke/recovery machinery there too).
+  if (tlsPort) {
+    const wsT = await connectWS(tlsPort, 'telnet', true);
+    const st = telnetSession(wsT);
+    check('wss (TLS) telnet connection reaches the banner',
+          await waitFor(() => st.text.length > 50, 15000));
+    st.text = '';
+    wsT.sock.pause();
+    st.sendText(BACKPRESSURE_BURST_CMD + '\r\n');
+    await sleep(1500);
+    wsT.sock.resume();
+    const gotTlsBp = await waitFor(() => st.text.includes('|END|'), 20000);
+    check('wss: recovers from genuine backpressure',
+          gotTlsBp && st.text.length > 4700000, st.text.length + ' chars');
+    const fpBefore = wsT.peerFingerprint;
+    check('wss: first handshake presents a peer certificate', !!fpBefore, fpBefore || 'none');
+    let opensslBefore;
+    try {
+      opensslBefore = opensslPeerCert(tlsPort);
+    } catch (e) {
+      check('wss: openssl s_client reads the boot certificate', false, e.message);
+    }
+    if (opensslBefore) {
+      check('wss: openssl s_client reads the boot certificate', true, opensslBefore);
+    }
+
+    // Issue #1395: prove new handshakes present the on-disk cert, not just
+    // that sys_reload_tls() returns. Overwrite the cert/key with a newly
+    // generated pair, reload, keep the existing session, and require a
+    // fresh client (Node and openssl s_client) to see a different cert.
+    const tlsFiles = tlsFilePaths();
+    const origCert = fs.readFileSync(tlsFiles.cert);
+    const origKey = fs.readFileSync(tlsFiles.key);
+    let wsT2;
+    try {
+      writeFreshSelfSigned(tlsFiles.cert, tlsFiles.key);
+      st.text = '';
+      st.sendText(
+        `eval sys_reload_tls(${tlsIndex}); write("|TLS-RELOAD|"); return 0\r\n`);
+      const gotReload = await waitFor(() => st.text.includes('|TLS-RELOAD|'), 15000);
+      check('wss: sys_reload_tls() reloads after the cert files change',
+            gotReload && driverLog.includes('Reloading TLS config for port ' + tlsPort),
+            gotReload ? 'reload marker; log ' + (driverLog.includes('Reloading TLS config for port ' + tlsPort) ? 'ok' : 'missing')
+                      : st.text.slice(-200));
+      st.text = '';
+      st.sendText('eval write("|STILL-ALIVE|"); return 0\r\n');
+      check('wss: existing session survives the cert reload',
+            await waitFor(() => st.text.includes('|STILL-ALIVE|'), 15000));
+      wsT2 = await connectWS(tlsPort, 'telnet', true);
+      const st2 = telnetSession(wsT2);
+      const fpAfter = wsT2.peerFingerprint;
+      check('wss: new client is presented the replacement certificate',
+            !!fpAfter && fpAfter !== fpBefore,
+            fpAfter ? `before ${fpBefore} after ${fpAfter}` : 'no peer cert');
+      let opensslAfter;
+      try {
+        opensslAfter = opensslPeerCert(tlsPort);
+      } catch (e) {
+        check('wss: openssl s_client sees the replacement certificate', false, e.message);
+      }
+      if (opensslAfter) {
+        check('wss: openssl s_client sees the replacement certificate',
+              opensslAfter !== opensslBefore,
+              `before ${opensslBefore} after ${opensslAfter}`);
+      }
+      check('wss: new client reaches the banner after the cert swap',
+            await waitFor(() => st2.text.length > 50, 15000));
+    } finally {
+      fs.writeFileSync(tlsFiles.cert, origCert);
+      fs.writeFileSync(tlsFiles.key, origKey);
+      if (wsT2) wsT2.close();
+    }
+    wsT.close();
+  }
+
+  kill();
+  const failed = results.filter((r) => !r.ok);
+  console.log(`\n${results.length - failed.length}/${results.length} websocket smoke checks passed`);
+  process.exit(failed.length ? 1 : 0);
+}
+
+const watchdog = setTimeout(() => {
+  console.error('ws-smoke: global timeout');
+  process.exit(2);
+}, 240000);
+watchdog.unref();
+
+main().catch((e) => {
+  console.error('ws-smoke error:', e);
+  process.exit(2);
+});

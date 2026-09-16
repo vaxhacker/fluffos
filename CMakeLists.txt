@@ -16,6 +16,21 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
+# Export compile_commands.json for clangd / language servers (Makefile + Ninja only)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Target: symlink compile_commands.json from the build dir to the project root
+# so that editors and tools find it without extra configuration.
+if(NOT WIN32)
+  add_custom_target(compile_commands
+    COMMAND "${CMAKE_COMMAND}" -E create_symlink
+            "${CMAKE_BINARY_DIR}/compile_commands.json"
+            "${CMAKE_SOURCE_DIR}/compile_commands.json"
+    COMMENT "Symlinking compile_commands.json to project root"
+    VERBATIM
+  )
+endif()
+
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
     set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}" CACHE PATH "..." FORCE)
 endif()
@@ -81,3 +96,127 @@ if(${GTEST_FOUND})
 endif()
 
 add_subdirectory(src)
+
+if (CMAKE_CROSSCOMPILING)
+  # No native driver binary to run the LPC testsuite with (the WASM
+  # driver runs it in the page / under node instead).
+  return()
+endif ()
+
+add_custom_target(driver-testsuite
+        COMMAND $<TARGET_FILE:driver> etc/config.test
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/testsuite"
+        COMMENT "Running driver with testsuite"
+)
+
+add_custom_target(driver-autotest
+        COMMAND $<TARGET_FILE:driver> etc/config.test -ftest
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/testsuite"
+        COMMENT "Running driver automated tests"
+)
+
+# The LPC testsuite as a first-class ctest test: `ctest -R testsuite`
+# (equivalently `ctest -L testsuite`; plain `ctest` includes it) runs the
+# whole mudlib suite alongside the GTest binaries. The runner prints gtest-style [ RUN ]/[ OK ]/[ FAILED ]
+# blocks; "Checks succeeded." plus a clean exit is the pass signal, and
+# any recorded failure prints a [  FAILED  ] recap and exits nonzero.
+enable_testing()
+add_test(NAME testsuite
+        COMMAND $<TARGET_FILE:driver> etc/config.test -ftest
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/testsuite")
+set_tests_properties(testsuite PROPERTIES
+        PASS_REGULAR_EXPRESSION "Checks succeeded\\."
+        FAIL_REGULAR_EXPRESSION "\\[  FAILED  \\]"
+        TIMEOUT 600
+        LABELS "testsuite"
+        RESOURCE_LOCK "fluffos_external_ports")
+
+# lpcshell drives the REPL binary itself in script mode against the same
+# mudlib: the wrapping it is being tested for (deciding whether typed text
+# is an expression or a statement, and reporting what happened) lives in
+# C++ in main_lpcshell.cc, so the LPC testsuite above cannot reach it.
+# `ctest -L lpcshell` runs just these.
+#
+# Both assert on OUTPUT rather than exit status -- lpcshell-errors evaluates
+# deliberately-failing statements and so exits nonzero by design, and CMake
+# ignores the exit code once PASS_REGULAR_EXPRESSION is set.
+add_test(NAME lpcshell-eval
+        COMMAND $<TARGET_FILE:lpcshell> etc/config.test lpcshell/eval.lpcs
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/testsuite")
+set_tests_properties(lpcshell-eval PROPERTIES
+        PASS_REGULAR_EXPRESSION "EVAL_OK"
+        FAIL_REGULAR_EXPRESSION "EVAL_BAD;syntax error"
+        TIMEOUT 120
+        LABELS "lpcshell")
+
+# The regression guard. A bare expression that error()s must report the
+# real message and must NOT be retried in statement form: the retry would
+# re-run whatever side effects the expression already had (asserted via
+# n=1 -- n=2 means it ran twice) and report a bogus "syntax error,
+# unexpected '}'" against the generated wrapper's closing brace, burying
+# the real error entirely.
+add_test(NAME lpcshell-errors
+        COMMAND $<TARGET_FILE:lpcshell> etc/config.test lpcshell/errors.lpcs
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/testsuite")
+set_tests_properties(lpcshell-errors PROPERTIES
+        PASS_REGULAR_EXPRESSION "error: boom"
+        FAIL_REGULAR_EXPRESSION "syntax error;n=0;n=2"
+        TIMEOUT 120
+        LABELS "lpcshell")
+
+# lpcshell predefines __LPCSHELL__ so a mudlib can tell it is being compiled
+# for the shell rather than a live driver. It has to be visible by the time
+# the MASTER compiles -- early enough to branch on in epilog() -- which is
+# why it cannot be a master::flag() call; see single/master.lpc's epilog(),
+# which prints this marker under the guard.
+add_test(NAME lpcshell-predefine
+        COMMAND $<TARGET_FILE:lpcshell> etc/config.test lpcshell/eval.lpcs
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/testsuite")
+set_tests_properties(lpcshell-predefine PROPERTIES
+        PASS_REGULAR_EXPRESSION "LPCSHELL_PREDEFINED"
+        TIMEOUT 120
+        LABELS "lpcshell")
+
+# Regression guard for a heap-use-after-free at clean process exit: a
+# statement that compiles successfully but produces a warning WITH an
+# attached fix-it (compiler_pending_fixits -> Diagnostic::fixits, a
+# ScratchVector), and nothing evaluated afterward. compiler_diags (holding
+# that Diagnostic) is only ever dropped at the TOP of the next Eval() --
+# there is no next call here, so it is still holding it, backed by
+# Session::arena, when main() returns and destroys `session`. Without
+# Session::~Session() calling compiler_drop_arena_state() first,
+# ~ScratchArena() frees the arena's chunks while compiler_diags' elements
+# still reference them, and destroying compiler_diags at static-teardown
+# (g_compile's) reads freed memory -- confirmed under ASan as a
+# heap-use-after-free in Diagnostic::FixIt::~FixIt().
+#
+# (A warning with only plain ScratchString fields -- no populated
+# ScratchVector member such as notes/expansions/fixits/ranges/included_from
+# -- would NOT reproduce this: destroying a ScratchString never dereferences
+# its own buffer, only a non-empty ScratchVector's destructor walks its
+# arena-allocated backing array to destroy each element.)
+add_test(NAME lpcshell-warning-at-exit
+        COMMAND $<TARGET_FILE:lpcshell> etc/config.test lpcshell/warning_at_exit.lpcs
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/testsuite")
+set_tests_properties(lpcshell-warning-at-exit PROPERTIES
+        PASS_REGULAR_EXPRESSION "Unknown escape sequence"
+        TIMEOUT 120
+        LABELS "lpcshell")
+
+# Issue #1395: sys_reload_tls() on a websocket TLS port must present a
+# newly written on-disk cert to the next handshake. GTest and the LPC
+# suite cannot inspect the peer certificate; this Node+openssl client
+# is the gate. Label `websocket` so `ctest -LE testsuite` (CI unit tests)
+# still runs it. RESOURCE_LOCK shares the config.test ports with the LPC
+# suite. Skipped when node or openssl is missing (Windows CI).
+find_program(NODE_EXECUTABLE node)
+find_program(OPENSSL_EXECUTABLE openssl)
+if (NODE_EXECUTABLE AND OPENSSL_EXECUTABLE)
+  add_test(NAME ws-tls-reload
+          COMMAND "${NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ws-tls-reload.js"
+                  $<TARGET_FILE:driver> "${CMAKE_SOURCE_DIR}/testsuite")
+  set_tests_properties(ws-tls-reload PROPERTIES
+          TIMEOUT 90
+          LABELS "websocket"
+          RESOURCE_LOCK "fluffos_external_ports")
+endif ()

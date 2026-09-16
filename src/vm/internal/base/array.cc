@@ -3,6 +3,8 @@
 #include "vm/internal/base/machine.h"
 
 #include <stdlib.h>  // for qsort
+#include <cstring>
+#include <vector>
 
 #include "vm/internal/apply.h"
 #include "vm/internal/simulate.h"
@@ -20,10 +22,10 @@
  * by the MudOS driver.
  */
 
-static int builtin_sort_array_cmp_fwd(const void * /*vp1*/, const void * /*vp2*/);
-static int builtin_sort_array_cmp_rev(const void * /*vp1*/, const void * /*vp2*/);
-static int sort_array_cmp(const void * /*vp1*/, const void * /*vp2*/);
-static long alist_cmp(svalue_t * /*p1*/, svalue_t * /*p2*/);
+static int builtin_sort_array_cmp_fwd(const void* /*vp1*/, const void* /*vp2*/);
+static int builtin_sort_array_cmp_rev(const void* /*vp1*/, const void* /*vp2*/);
+static int sort_array_cmp(const void* /*vp1*/, const void* /*vp2*/);
+static long alist_cmp(svalue_t* /*p1*/, svalue_t* /*p2*/);
 /*
  * Make an empty array for everyone to use, never to be deallocated.
  * It is cheaper to reuse it, than to use MALLOC() and allocate.
@@ -42,7 +44,7 @@ array_t the_null_array = {
 };
 
 #ifdef PACKAGE_MUDLIB_STATS
-static void ms_setup_stats(array_t *p) {
+static void ms_setup_stats(array_t* p) {
   if (current_object) {
     assign_stats(&p->stats, current_object);
     add_array_size(&p->stats, p->size);
@@ -72,8 +74,8 @@ static void ms_setup_stats(array_t *p) {
  *
  * Note that we rely a bit on gcc automatically inlining small routines.
  */
-static array_t *int_allocate_empty_array(unsigned int n) {
-  array_t *p;
+static array_t* int_allocate_empty_array(unsigned int n) {
+  array_t* p;
 
   num_arrays++;
   total_array_size += sizeof(array_t) + sizeof(svalue_t) * (n - 1);
@@ -86,7 +88,7 @@ static array_t *int_allocate_empty_array(unsigned int n) {
   return p;
 }
 
-array_t *allocate_empty_array(int n) {
+array_t* allocate_empty_array(int n) {
   auto max_array_size = CONFIG_INT(__MAX_ARRAY_SIZE__);
 
   if (n < 0 || n > max_array_size) {
@@ -99,8 +101,8 @@ array_t *allocate_empty_array(int n) {
   return int_allocate_empty_array(n);
 }
 
-static array_t *int_allocate_array(unsigned int n) {
-  array_t *p = int_allocate_empty_array(n);
+static array_t* int_allocate_array(unsigned int n) {
+  array_t* p = int_allocate_empty_array(n);
 
   while (n--) {
     p->item[n] = const0;
@@ -109,8 +111,8 @@ static array_t *int_allocate_array(unsigned int n) {
   return p;
 }
 
-array_t *allocate_array(int n) {
-  array_t *p = allocate_empty_array(n);
+array_t* allocate_array(int n) {
+  array_t* p = allocate_empty_array(n);
 
   while (n--) {
     p->item[n] = const0;
@@ -119,21 +121,27 @@ array_t *allocate_array(int n) {
   return p;
 }
 
-array_t *allocate_array2(int n, svalue_t *svp) {
+array_t* allocate_array2(int n, svalue_t* svp) {
   int i;
-  array_t *ret;
+  array_t* ret;
 
   if (svp->type == T_FUNCTION) {
     ret = allocate_array(n);
+    // The callback runs arbitrary LPC and may error()/longjmp out of the
+    // loop. Keep ret on the VM stack so the unwind reclaims it (along with
+    // any refcounted values already stored) instead of leaking it; detach it
+    // without freeing on the normal path. (mirrors allocate_mapping2/map_array)
+    push_refed_array(ret);
 
     for (i = 0; i < n; i++) {
-      svalue_t *r;
+      svalue_t* r;
 
       push_number(i);
       r = call_function_pointer(svp->u.fp, 1);
       ret->item[i] = *r;
       r->type = T_NUMBER;
     }
+    sp--; /* detach ret from the stack; caller owns the reference */
   } else {
     ret = allocate_empty_array(n);
 
@@ -145,16 +153,16 @@ array_t *allocate_array2(int n, svalue_t *svp) {
   return ret;
 }
 
-static void dealloc_empty_array(array_t *p) {
+static void dealloc_empty_array(array_t* p) {
   ms_remove_stats(p);
 
   num_arrays--;
   total_array_size -= sizeof(array_t) + sizeof(svalue_t) * (p->size - 1);
 
-  FREE((char *)p);
+  FREE((char*)p);
 }
 
-void dealloc_array(array_t *p) {
+void dealloc_array(array_t* p) {
   int i;
 
   for (i = p->size; i--;) {
@@ -163,7 +171,7 @@ void dealloc_array(array_t *p) {
   dealloc_empty_array(p);
 }
 
-void free_array(array_t *p) {
+void free_array(array_t* p) {
   if (--(p->ref) > 0 || (p == &the_null_array)) {
     return;
   }
@@ -171,7 +179,7 @@ void free_array(array_t *p) {
   dealloc_array(p);
 }
 
-void free_empty_array(array_t *p) {
+void free_empty_array(array_t* p) {
   if ((--(p->ref) > 0) || (p == &the_null_array)) {
     return;
   }
@@ -181,7 +189,7 @@ void free_empty_array(array_t *p) {
 
 /* Finish setting up an array allocated with ALLOC_ARRAY, resizing it to
    size n */
-static array_t *fix_array(array_t *p, unsigned int n) {
+static array_t* fix_array(array_t* p, unsigned int n) {
   if (n) {
     num_arrays++;
     total_array_size += sizeof(array_t) + sizeof(svalue_t) * (n - 1);
@@ -199,7 +207,7 @@ static array_t *fix_array(array_t *p, unsigned int n) {
   return &the_null_array;
 }
 
-array_t *resize_array(array_t *p, unsigned int n) {
+array_t* resize_array(array_t* p, unsigned int n) {
   total_array_size -= p->size * sizeof(svalue_t);
   total_array_size += n * sizeof(svalue_t);
   if (n) {
@@ -222,7 +230,7 @@ array_t *resize_array(array_t *p, unsigned int n) {
   return p;
 }
 
-array_t *explode_string(const char *str, int slen, const char *del, int dellen, bool reversible) {
+array_t* explode_string(const char* str, int slen, const char* del, int dellen, bool reversible) {
   auto max_array_size = CONFIG_INT(__MAX_ARRAY_SIZE__);
 
   // fast track empty arrays
@@ -238,12 +246,12 @@ array_t *explode_string(const char *str, int slen, const char *del, int dellen, 
     if (size > max_array_size) {
       size = max_array_size;
     }
-    auto *ret = int_allocate_empty_array(size);
+    auto* ret = int_allocate_empty_array(size);
     for (int j = 0; j < size; j++) {
       ret->item[j].type = T_STRING;
       ret->item[j].subtype = STRING_MALLOC;
 
-      auto *dest = new_string(result[j].size(), "explode_string: tmp");
+      auto* dest = new_string(result[j].size(), "explode_string: tmp");
       result[j].copy(dest, result[j].size());
       dest[result[j].size()] = '\0';
 
@@ -258,6 +266,9 @@ array_t *explode_string(const char *str, int slen, const char *del, int dellen, 
   auto num_leading = 0;
   auto num_trailing = 0;
 
+  // One iterator over the whole input. Each delimiter match then reset()s
+  // it to the remaining suffix/prefix; for ASCII that must not rescan (see
+  // EGCIterator::reset and issue #1366).
   EGCIterator iter(source, sourcelen);
   /*
    * Count leading 'del' strings.
@@ -299,6 +310,24 @@ array_t *explode_string(const char *str, int slen, const char *del, int dellen, 
   }
 
   if (!sourcelen || source[0] == '\0') {
+    // In reversible mode the leading pass may have consumed the entire
+    // string: n delimiters still split into n+1 empty fields so that
+    // implode(explode(s, d), d) == s holds (issue #968).
+    if (reversible && num_leading) {
+      auto num = num_leading + 1;
+      if (num > max_array_size) {
+        num = max_array_size;
+      }
+      auto* ret = int_allocate_empty_array(num);
+      for (int i = 0; i < num; i++) {
+        ret->item[i].type = T_STRING;
+        ret->item[i].subtype = STRING_MALLOC;
+        auto* dest = new_string(0, "explode_string: empty field");
+        dest[0] = '\0';
+        ret->item[i].u.string = dest;
+      }
+      return ret;
+    }
     return &the_null_array;
   }
 
@@ -341,12 +370,12 @@ array_t *explode_string(const char *str, int slen, const char *del, int dellen, 
   if (num > max_array_size) {
     num = max_array_size;
   }
-  auto *ret = int_allocate_empty_array(num);
+  auto* ret = int_allocate_empty_array(num);
   for (int i = 0; i < num; i++) {
     ret->item[i].type = T_STRING;
     ret->item[i].subtype = STRING_MALLOC;
 
-    auto *dest = new_string(results[i].size(), "explode_string: buff");
+    auto* dest = new_string(results[i].size(), "explode_string: buff");
     results[i].copy(dest, results[i].size());
     dest[results[i].length()] = '\0';
 
@@ -355,7 +384,7 @@ array_t *explode_string(const char *str, int slen, const char *del, int dellen, 
   return ret;
 }
 
-char *implode_string(array_t *arr, const char *del, int del_len) {
+char* implode_string(array_t* arr, const char* del, int del_len) {
   int size, i, num;
   char *p, *q;
 
@@ -376,11 +405,13 @@ char *implode_string(array_t *arr, const char *del, int del_len) {
   for (i = 0, num = 0; i < arr->size; i++) {
     if (arr->item[i].type == T_STRING) {
       if (num) {
-        strncpy(p, del, del_len);
+        // del_len is the counted LPC string length, so a byte-for-byte copy
+        // is both correct (even with embedded NULs) and faster than strncpy.
+        memcpy(p, del, del_len);
         p += del_len;
       }
       size = SVALUE_STRLEN(&arr->item[i]);
-      strncpy(p, arr->item[i].u.string, size);
+      memcpy(p, arr->item[i].u.string, size);
       p += size;
       num++;
     }
@@ -389,9 +420,9 @@ char *implode_string(array_t *arr, const char *del, int del_len) {
   return q;
 }
 
-void implode_array(funptr_t *fptr, array_t *arr, svalue_t *dest, int first_on_stack) {
+void implode_array(funptr_t* fptr, array_t* arr, svalue_t* dest, int first_on_stack) {
   int i = 0, n;
-  svalue_t *v;
+  svalue_t* v;
 
   if (first_on_stack) {
     if (!(n = arr->size)) {
@@ -434,7 +465,7 @@ void implode_array(funptr_t *fptr, array_t *arr, svalue_t *dest, int first_on_st
  * Slice of an array.
  * It now frees the passed array
  */
-array_t *slice_array(array_t *p, int from, int to) {
+array_t* slice_array(array_t* p, int from, int to) {
   auto max_array_size = CONFIG_INT(__MAX_ARRAY_SIZE__);
 
   int cnt;
@@ -478,7 +509,7 @@ array_t *slice_array(array_t *p, int from, int to) {
     p->ref = 1;
     return p;
   } else {
-    array_t *d;
+    array_t* d;
     if (to - from + 1 > max_array_size) {
       error("array slice too big");  // can't happen in theory
     }
@@ -495,8 +526,8 @@ array_t *slice_array(array_t *p, int from, int to) {
 /*
  * Copy of an array
  */
-array_t *copy_array(array_t *p) {
-  array_t *d;
+array_t* copy_array(array_t* p) {
+  array_t* d;
   int n;
   svalue_t *sv1 = p->item, *sv2;
 
@@ -509,13 +540,13 @@ array_t *copy_array(array_t *p) {
 }
 
 #ifdef F_COMMANDS
-array_t *commands(object_t *ob) {
+array_t* commands(object_t* ob) {
   auto max_array_size = CONFIG_INT(__MAX_ARRAY_SIZE__);
 
-  sentence_t *s;
+  sentence_t* s;
   array_t *v, *p;
   int cnt = 0;
-  svalue_t *sv;
+  svalue_t* sv;
 
   for (s = ob->sent; s && s->verb; s = s->next) {
     if (++cnt == max_array_size) {
@@ -556,7 +587,7 @@ array_t *commands(object_t *ob) {
    */
 
 #ifdef F_FILTER
-void filter_array(svalue_t *arg, int num_arg) {
+void filter_array(svalue_t* arg, int num_arg) {
   array_t *vec = arg->u.arr, *r;
   int size;
 
@@ -564,7 +595,7 @@ void filter_array(svalue_t *arg, int num_arg) {
     pop_n_elems(num_arg - 1);
     return;
   } else {
-    svalue_t *v;
+    svalue_t* v;
     int res = 0, cnt;
     function_to_call_t ftc;
 
@@ -599,20 +630,20 @@ void filter_array(svalue_t *arg, int num_arg) {
   }
 }
 
-void filter_string(svalue_t *arg, int num_arg) {
+void filter_string(svalue_t* arg, int num_arg) {
   if (arg->u.string[0] == 0) {
     pop_n_elems(num_arg - 1);
     return;
   } else {
     int size;
-    svalue_t *v;
+    svalue_t* v;
     int idx = 0, cnt;
     function_to_call_t ftc;
-    char *str;
+    char* str;
 
     unlink_string_svalue(arg);
     size = SVALUE_STRLEN(arg);
-    str = const_cast<char *>(arg->u.string);
+    str = const_cast<char*>(arg->u.string);
 
     process_efun_callback(1, &ftc, F_FILTER);
 
@@ -658,7 +689,7 @@ void filter_string(svalue_t *arg, int num_arg) {
    */
 
 /* nonstatic, is used in mappings too */
-int sameval(svalue_t *arg1, svalue_t *arg2) {
+int sameval(svalue_t* arg1, svalue_t* arg2) {
   DEBUG_CHECK(!arg1 || !arg2, "Null pointer passed to sameval.\n");
 
   switch (arg1->type | arg2->type) {
@@ -682,6 +713,8 @@ int sameval(svalue_t *arg1, svalue_t *arg2) {
       return arg1->u.real == arg2->u.real;
     case T_BUFFER:
       return arg1->u.buf == arg2->u.buf;
+    case T_PROMISE:
+      return arg1->u.prom == arg2->u.prom;
   }
   return 0;
 }
@@ -691,41 +724,41 @@ int sameval(svalue_t *arg1, svalue_t *arg2) {
 typedef struct unique_s {
   svalue_t mark;
   int count;
-  struct unique_s *next;
-  int *indices;
+  struct unique_s* next;
+  int* indices;
 } unique_t;
 
 typedef struct unique_list_s {
-  unique_t *head;
-  struct unique_list_s *next;
+  unique_t* head;
+  struct unique_list_s* next;
 } unique_list_t;
 
-static unique_list_t *g_u_list = nullptr;
+static unique_list_t* g_u_list = nullptr;
 
 static void unique_array_error_handler(void) {
-  unique_list_t *unlist = g_u_list;
+  unique_list_t* unlist = g_u_list;
   unique_t *uptr = unlist->head, *nptr;
 
   g_u_list = g_u_list->next;
   while (uptr) {
     nptr = uptr->next;
-    FREE((char *)uptr->indices);
+    FREE((char*)uptr->indices);
     free_svalue(&uptr->mark, "unique_array_error_handler");
-    FREE((char *)uptr);
+    FREE((char*)uptr);
     uptr = nptr;
   }
-  FREE((char *)unlist);
+  FREE((char*)unlist);
 }
 
 void f_unique_array(void) {
   array_t *v, *ret;
   long size, i, numkeys = 0, num_arg = st_num_arg;
-  int *ind;
+  int* ind;
   svalue_t *skipval, *sv, *svp;
-  unique_list_t *unlist;
+  unique_list_t* unlist;
   unique_t **head, *uptr, *nptr;
-  funptr_t *fptr = nullptr;
-  const char *func;
+  funptr_t* fptr = nullptr;
+  const char* func;
 
   size = (v = (sp - num_arg + 1)->u.arr)->size;
   if (!size) {
@@ -752,7 +785,7 @@ void f_unique_array(void) {
     }
   }
 
-  unlist = reinterpret_cast<unique_list_t *>(
+  unlist = reinterpret_cast<unique_list_t*>(
       DMALLOC(sizeof(unique_list_t), TAG_TEMPORARY, "f_unique_array:1"));
   unlist->next = g_u_list;
   unlist->head = nullptr;
@@ -786,10 +819,10 @@ void f_unique_array(void) {
       }
       if (!uptr) {
         numkeys++;
-        uptr = reinterpret_cast<unique_t *>(
+        uptr = reinterpret_cast<unique_t*>(
             DMALLOC(sizeof(unique_t), TAG_TEMPORARY, "f_unique_array:3"));
         uptr->indices =
-            reinterpret_cast<int *>(DMALLOC(sizeof(int), TAG_TEMPORARY, "f_unique_array:4"));
+            reinterpret_cast<int*>(DMALLOC(sizeof(int), TAG_TEMPORARY, "f_unique_array:4"));
         uptr->count = 1;
         uptr->indices[0] = i;
         uptr->next = *head;
@@ -811,14 +844,14 @@ void f_unique_array(void) {
     while (i--) {
       assign_svalue_no_free(--skipval, svp + ind[i]);
     }
-    FREE((char *)ind);
+    FREE((char*)ind);
     free_svalue(&uptr->mark, "f_unique_array");
-    FREE((char *)uptr);
+    FREE((char*)uptr);
     uptr = nptr;
   }
 
   unlist = g_u_list->next;
-  FREE((char *)g_u_list);
+  FREE((char*)g_u_list);
   g_u_list = unlist;
   sp--;
   pop_n_elems(num_arg - 1);
@@ -834,11 +867,11 @@ void f_unique_array(void) {
 
 /* Concatenation of two arrays into one
  */
-array_t *add_array(array_t *p, array_t *r) {
+array_t* add_array(array_t* p, array_t* r) {
   auto max_array_size = CONFIG_INT(__MAX_ARRAY_SIZE__);
 
   int cnt, res;
-  array_t *d; /* destination */
+  array_t* d; /* destination */
 
   /*
    * have to be careful with size zero arrays because they could be
@@ -904,11 +937,11 @@ array_t *add_array(array_t *p, array_t *r) {
 
 #ifndef NO_ENVIRONMENT
 /* Returns an array of all objects contained in 'ob' */
-array_t *all_inventory(object_t *ob, int override) {
+array_t* all_inventory(object_t* ob, int override) {
   auto max_array_size = CONFIG_INT(__MAX_ARRAY_SIZE__);
 
-  array_t *d;
-  object_t *cur;
+  array_t* d;
+  object_t* cur;
   int cnt, res;
   int display_hidden;
 
@@ -965,9 +998,9 @@ array_t *all_inventory(object_t *ob, int override) {
    and replaces each value in arr by the value returned by ob::func
    */
 #ifdef F_MAP
-void map_array(svalue_t *arg, int num_arg) {
-  array_t *arr = arg->u.arr;
-  array_t *r;
+void map_array(svalue_t* arg, int num_arg) {
+  array_t* arr = arg->u.arr;
+  array_t* r;
   int size;
 
   if ((size = arr->size) == 0) {
@@ -975,7 +1008,7 @@ void map_array(svalue_t *arg, int num_arg) {
   } else {
     function_to_call_t ftc;
     int cnt;
-    svalue_t *v;
+    svalue_t* v;
 
     process_efun_callback(1, &ftc, F_MAP);
 
@@ -999,14 +1032,14 @@ void map_array(svalue_t *arg, int num_arg) {
   push_refed_array(r);
 }
 
-void map_string(svalue_t *arg, int num_arg) {
-  char *arr;
-  char *p;
-  funptr_t *fptr = nullptr;
+void map_string(svalue_t* arg, int num_arg) {
+  char* arr;
+  char* p;
+  funptr_t* fptr = nullptr;
   int numex = 0;
-  object_t *ob = nullptr;
+  object_t* ob = nullptr;
   svalue_t *extra, *v;
-  const char *func = nullptr;
+  const char* func = nullptr;
 
   /* get a modifiable string */
   /* do not use arg after this; it has been copied or freed.
@@ -1014,7 +1047,7 @@ void map_string(svalue_t *arg, int num_arg) {
      error (note it is also in the right spot for the return value).
    */
   unlink_string_svalue(arg);
-  arr = const_cast<char *>(arg->u.string);
+  arr = const_cast<char*>(arg->u.string);
 
   if (arg[1].type == T_FUNCTION) {
     fptr = arg[1].u.fp;
@@ -1065,24 +1098,32 @@ void map_string(svalue_t *arg, int num_arg) {
     }
   }
 
+  // The callback's return value was written straight into the unlinked
+  // STRING_MALLOC buffer, and it can be ANY byte -- including '\r' (13),
+  // which breaks the byte==grapheme-cluster identity behind a cached
+  // MSTR_ASCII_YES tag ("\r\n" is one cluster), or a >= 0x80 byte. Nothing
+  // on this path reallocates (extend_string() is what normally resets the
+  // tag), so drop the cache and let it re-derive from the new contents.
+  MSTR_ASCII(arg->u.string) = MSTR_ASCII_UNKNOWN;
+
   pop_n_elems(num_arg - 1);
   /* return value on stack */
 }
 #endif
 
 #ifdef F_SORT_ARRAY
-static function_to_call_t *sort_array_ftc;
+static function_to_call_t* sort_array_ftc;
 
-array_t *builtin_sort_array(array_t *inlist, int dir) {
-  qsort(reinterpret_cast<char *>(inlist->item), inlist->size, sizeof(inlist->item),
+array_t* builtin_sort_array(array_t* inlist, int dir) {
+  qsort(reinterpret_cast<char*>(inlist->item), inlist->size, sizeof(inlist->item),
         (dir < 0) ? builtin_sort_array_cmp_rev : builtin_sort_array_cmp_fwd);
 
   return inlist;
 }
 
-static int builtin_sort_array_cmp_fwd(const void *vp1, const void *vp2) {
-  auto *p1 = (svalue_t *)vp1;
-  auto *p2 = (svalue_t *)vp2;
+static int builtin_sort_array_cmp_fwd(const void* vp1, const void* vp2) {
+  auto* p1 = (svalue_t*)vp1;
+  auto* p2 = (svalue_t*)vp2;
   switch (p1->type | p2->type) {
     case T_STRING: {
       return strcmp(p1->u.string, p2->u.string);
@@ -1129,14 +1170,14 @@ static int builtin_sort_array_cmp_fwd(const void *vp1, const void *vp2) {
   return 0;
 }
 
-static int builtin_sort_array_cmp_rev(const void *vp1, const void *vp2) {
+static int builtin_sort_array_cmp_rev(const void* vp1, const void* vp2) {
   return builtin_sort_array_cmp_fwd(vp2, vp1);
 }
 
-static int sort_array_cmp(const void *vp1, const void *vp2) {
-  auto *p1 = (svalue_t *)vp1;
-  auto *p2 = (svalue_t *)vp2;
-  svalue_t *d;
+static int sort_array_cmp(const void* vp1, const void* vp2) {
+  auto* p1 = (svalue_t*)vp1;
+  auto* p2 = (svalue_t*)vp2;
+  svalue_t* d;
 
   push_svalue(p1);
   push_svalue(p2);
@@ -1155,8 +1196,8 @@ static int sort_array_cmp(const void *vp1, const void *vp2) {
 }
 
 void f_sort_array(void) {
-  svalue_t *arg = sp - st_num_arg + 1;
-  array_t *tmp = arg->u.arr;
+  svalue_t* arg = sp - st_num_arg + 1;
+  array_t* tmp = arg->u.arr;
   int num_arg = st_num_arg;
 
   check_for_destr(tmp);
@@ -1186,9 +1227,9 @@ void f_sort_array(void) {
       tmp = copy_array(tmp);
       push_refed_array(tmp);
       if (CONFIG_INT(__RC_SANE_SORTING__)) {
-        qsort(reinterpret_cast<char *>(tmp->item), tmp->size, sizeof(tmp->item), sort_array_cmp);
+        qsort(reinterpret_cast<char*>(tmp->item), tmp->size, sizeof(tmp->item), sort_array_cmp);
       } else {
-        old_quickSort((char *)tmp->item, tmp->size, sizeof(tmp->item), sort_array_cmp);
+        old_quickSort((char*)tmp->item, tmp->size, sizeof(tmp->item), sort_array_cmp);
       }
       sort_array_ftc = old_ptr;
       sp--;  // remove tmp from stack, but we don't want to free it!
@@ -1217,8 +1258,8 @@ void f_sort_array(void) {
 #ifndef NO_ENVIRONMENT
 static int valid_hide_flag;
 
-static int deep_inventory_count(object_t *ob) {
-  object_t *cur;
+static int deep_inventory_count(object_t* ob) {
+  object_t* cur;
   int cnt;
 
   cnt = 0;
@@ -1244,9 +1285,9 @@ static int deep_inventory_count(object_t *ob) {
   return cnt;
 }
 
-static void deep_inventory_collect(object_t *ob, array_t *inv, int *i, int max, funptr_t *fp) {
+static void deep_inventory_collect(object_t* ob, array_t* inv, int* i, int max, funptr_t* fp) {
   object_t *cur, *next;
-  svalue_t *fp_result;
+  svalue_t* fp_result;
 
   /* step through object's inventory and look for visible objects */
   for (cur = ob->contains; cur && *i < max; cur = next) {
@@ -1294,12 +1335,12 @@ static void deep_inventory_collect(object_t *ob, array_t *inv, int *i, int max, 
   }
 }
 
-array_t *deep_inventory(object_t *ob, int take_top, funptr_t *fp) {
+array_t* deep_inventory(object_t* ob, int take_top, funptr_t* fp) {
   auto max_array_size = CONFIG_INT(__MAX_ARRAY_SIZE__);
 
-  array_t *dinv;
+  array_t* dinv;
   int i, o;
-  svalue_t *fp_result;
+  svalue_t* fp_result;
 
   valid_hide_flag = 0;
 
@@ -1363,12 +1404,12 @@ array_t *deep_inventory(object_t *ob, int take_top, funptr_t *fp) {
   return dinv;
 }
 
-array_t *deep_inventory_array(array_t *arr, int take_top, funptr_t *fp) {
+array_t* deep_inventory_array(array_t* arr, int take_top, funptr_t* fp) {
   auto max_array_size = CONFIG_INT(__MAX_ARRAY_SIZE__);
 
-  array_t *dinv;
+  array_t* dinv;
   int i, o, c;
-  svalue_t *fp_result;
+  svalue_t* fp_result;
 
   valid_hide_flag = 0;
 
@@ -1442,31 +1483,50 @@ array_t *deep_inventory_array(array_t *arr, int take_top, funptr_t *fp) {
 }
 #endif
 
-static long alist_cmp(svalue_t *p1, svalue_t *p2) {
-  long d;
-
-  if ((d = p1->u.number - p2->u.number)) {
-    if (d == LONG_MIN) {
-      d = p1->u.number > p2->u.number;
-    }
-    return d;
+/* Total order over raw svalue payload then type tag, used to sort the
+ * lookup table behind array '-', '&' and '|'. Every caller reads only the
+ * SIGN, so this returns -1/0/1 rather than a difference -- computing it as
+ * a subtraction is what made all three of the following wrong:
+ *
+ *  - `p1->u.number - p2->u.number` wraps (LPC_INT is 64-bit and -fwrapv
+ *    makes the overflow silent). The old guard special-cased the single
+ *    value it noticed, d == LONG_MIN, but rewrote it as `p1 > p2`, which is
+ *    0 when p1 < p2 -- i.e. "equal". bits(-x) - bits(x) is exactly LONG_MIN
+ *    for every float x > 0, so cmp(-1.0, 1.0) reported equal while
+ *    cmp(1.0, -1.0) reported greater: `({ -1.0, 1.0 }) - ({ 1.0 })` came
+ *    back empty, and the '&' of the same pair kept an element present in
+ *    neither side.
+ *  - `long` is 32-bit on the wasm32 and MinGW64 targets (both in CI), so
+ *    the 64-bit difference truncated there and any two ints agreeing modulo
+ *    2^32 compared equal -- `({ 0, 4294967296 }) - ({ 0 })` came back empty
+ *    on wasm while being correct natively.
+ *  - svalue_t::type is uint32_t, which (unlike the unsigned short it used
+ *    to be) does not integer-promote, so the tag subtraction was unsigned
+ *    and wrapped positive whenever p1's tag was the smaller one.
+ *
+ * All three shapes make the comparator asymmetric or intransitive, which
+ * sends the binary searches down the wrong half and silently drops or keeps
+ * the wrong elements -- no error, no crash. */
+static long alist_cmp(svalue_t* p1, svalue_t* p2) {
+  if (p1->u.number != p2->u.number) {
+    return (p1->u.number > p2->u.number) ? 1 : -1;
   }
-  if ((d = p1->type - p2->type)) {
-    return d;
+  if (p1->type != p2->type) {
+    return (p1->type > p2->type) ? 1 : -1;
   }
   return 0;
 }
 
-static svalue_t *alist_sort(array_t *inlist) {
+static svalue_t* alist_sort(array_t* inlist) {
   long size, j, curix, parix, child1, child2, flag;
   svalue_t *sv_tab, *tmp, *table, *sv_ptr, val;
-  const char *str;
+  const char* str;
 
   if (!(size = inlist->size)) {
-    return (svalue_t *)nullptr;
+    return (svalue_t*)nullptr;
   }
   if ((flag = (inlist->ref > 1))) {
-    sv_tab = reinterpret_cast<svalue_t *>(
+    sv_tab = reinterpret_cast<svalue_t*>(
         DCALLOC(size, sizeof(svalue_t), TAG_TEMPORARY, "alist_sort: sv_tab"));
     sv_ptr = inlist->item;
     for (j = 0; j < size; j++) {
@@ -1520,7 +1580,7 @@ static svalue_t *alist_sort(array_t *inlist) {
     }
   }
 
-  table = reinterpret_cast<svalue_t *>(
+  table = reinterpret_cast<svalue_t*>(
       DCALLOC(size, sizeof(svalue_t), TAG_TEMPORARY, "alist_sort: table"));
 
   for (j = 0; j < size; j++) {
@@ -1546,13 +1606,13 @@ static svalue_t *alist_sort(array_t *inlist) {
   }
 
   if (flag) {
-    FREE((char *)sv_tab);
+    FREE((char*)sv_tab);
   }
   return table;
 }
 
-array_t *subtract_array(array_t *minuend, array_t *subtrahend) {
-  array_t *difference;
+array_t* subtract_array(array_t* minuend, array_t* subtrahend) {
+  array_t* difference;
   svalue_t *source, *dest, *svt;
   long i, size, o, d, l, h, msize;
 
@@ -1612,15 +1672,15 @@ array_t *subtract_array(array_t *minuend, array_t *subtrahend) {
   while (i--) {
     free_svalue(svt + i, "subtract_array");
   }
-  FREE((char *)svt);
+  FREE((char*)svt);
   free_empty_array(subtrahend);
   free_array(minuend);
   msize = dest - difference->item;
   return fix_array(difference, msize);
 }
 
-array_t *intersect_array(array_t *a1, array_t *a2) {
-  array_t *a3;
+array_t* intersect_array(array_t* a1, array_t* a2) {
+  array_t* a3;
   long d, l, j, i, a1s = a1->size, a2s = a2->size, flag;
   svalue_t *svt_1, *ntab, *sv_tab, *sv_ptr, val, *tmp;
   long curix, parix, child1, child2;
@@ -1633,7 +1693,7 @@ array_t *intersect_array(array_t *a1, array_t *a2) {
 
   svt_1 = alist_sort(a1);
   if ((flag = (a2->ref > 1))) {
-    sv_tab = reinterpret_cast<svalue_t *>(
+    sv_tab = reinterpret_cast<svalue_t*>(
         DCALLOC(a2s, sizeof(svalue_t), TAG_TEMPORARY, "intersect_array: sv2_tab"));
     sv_ptr = a2->item;
     for (j = 0; j < a2s; j++) {
@@ -1661,7 +1721,7 @@ array_t *intersect_array(array_t *a1, array_t *a2) {
       }
     }
   } else {
-    const char *str;
+    const char* str;
 
     sv_tab = a2->item;
     for (j = 0; j < a2s; j++) {
@@ -1742,13 +1802,13 @@ settle_business:
   while (i--) {
     free_svalue(svt_1 + i, "intersect_array");
   }
-  FREE((char *)svt_1);
+  FREE((char*)svt_1);
 
   free_empty_array(a1);
 
   if (flag) {
     a2->ref--;
-    FREE((char *)sv_tab);
+    FREE((char*)sv_tab);
   } else {
     dealloc_empty_array(a2);
   }
@@ -1756,12 +1816,12 @@ settle_business:
   return fix_array(a3, l);
 }
 
-array_t *union_array(array_t *a1, array_t *a2) {
+array_t* union_array(array_t* a1, array_t* a2) {
   auto max_array_size = CONFIG_INT(__MAX_ARRAY_SIZE__);
 
   int a1s = a1->size, a2s = a2->size;
   long d, l, j, i, cnt, flag;
-  array_t *a3; /* destination */
+  array_t* a3; /* destination */
   svalue_t *svt_1, *ntab, *sv_tab, *tmp, *sv_ptr, val;
   long curix, parix, child1, child2;
 
@@ -1789,7 +1849,7 @@ array_t *union_array(array_t *a1, array_t *a2) {
 
   svt_1 = alist_sort(a1);
   if ((flag = (a2->ref > 1))) {
-    sv_tab = reinterpret_cast<svalue_t *>(
+    sv_tab = reinterpret_cast<svalue_t*>(
         DCALLOC(a2s, sizeof(svalue_t), TAG_TEMPORARY, "union_array: sv2_tab"));
     sv_ptr = a2->item;
     for (j = 0; j < a2s; j++) {
@@ -1817,7 +1877,7 @@ array_t *union_array(array_t *a1, array_t *a2) {
       }
     }
   } else {
-    const char *str;
+    const char* str;
 
     sv_tab = a2->item;
     for (j = 0; j < a2s; j++) {
@@ -1891,13 +1951,13 @@ array_t *union_array(array_t *a1, array_t *a2) {
   while (i--) {
     free_svalue(svt_1 + i, "union_array");
   }
-  FREE((char *)svt_1);
+  FREE((char*)svt_1);
 
   free_empty_array(a1);
 
   if (flag) {
     a2->ref--;
-    FREE((char *)sv_tab);
+    FREE((char*)sv_tab);
   } else {
     dealloc_empty_array(a2);
   }
@@ -1913,8 +1973,8 @@ array_t *union_array(array_t *a1, array_t *a2) {
  * Must be fixed so that any number of files can be returned, now max 256
  * (Sounds like a contradiction to me /Lars).
  */
-array_t *deep_inherit_list(object_t *ob) {
-  array_t *ret;
+array_t* deep_inherit_list(object_t* ob) {
+  array_t* ret;
   program_t *pr, *plist[256];
   int il, il2, next, cur;
 
@@ -1945,8 +2005,8 @@ array_t *deep_inherit_list(object_t *ob) {
  * Returns a list of the immediate inherited files.
  *
  */
-array_t *inherit_list(object_t *ob) {
-  array_t *ret;
+array_t* inherit_list(object_t* ob) {
+  array_t* ret;
   program_t *pr, *plist[256];
   int il, il2, next, cur;
 
@@ -1971,15 +2031,56 @@ array_t *inherit_list(object_t *ob) {
   return ret;
 }
 
-#ifdef F_LIVINGS
-static int livings_filter(object_t *ob, void *data) { return (ob->flags & O_ENABLE_COMMANDS); }
+/*
+ * Files this program actually #included (nested includes included,
+ * duplicates dropped, first-seen order). The main source is omitted;
+ * the configured global include file is listed when it was opened.
+ */
+array_t* include_list(object_t* ob) {
+  program_t* prog = ob->prog;
+  if (!prog || !prog->include_names || prog->include_names_size <= 0) {
+    return &the_null_array;
+  }
 
-array_t *livings() {
+  std::vector<const char*> names;
+  const char* p = prog->include_names;
+  const char* end = p + prog->include_names_size;
+  while (p < end) {
+    if (*p == '\0') {
+      p++;
+      continue;
+    }
+    bool seen = false;
+    for (const char* existing : names) {
+      if (strcmp(existing, p) == 0) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen) {
+      names.push_back(p);
+    }
+    p += strlen(p) + 1;
+  }
+
+  array_t* ret = allocate_empty_array(static_cast<int>(names.size()));
+  for (size_t i = 0; i < names.size(); i++) {
+    ret->item[i].type = T_STRING;
+    ret->item[i].subtype = STRING_MALLOC;
+    ret->item[i].u.string = add_slash(names[i]);
+  }
+  return ret;
+}
+
+#ifdef F_LIVINGS
+static int livings_filter(object_t* ob, void* data) { return (ob->flags & O_ENABLE_COMMANDS); }
+
+array_t* livings() {
   auto max_array_size = CONFIG_INT(__MAX_ARRAY_SIZE__);
 
   int count;
-  object_t **list;
-  array_t *ret;
+  object_t** list;
+  array_t* ret;
 
   get_objects(&list, &count, livings_filter, nullptr);
 
@@ -2003,10 +2104,10 @@ void f_objects(void) {
   auto max_array_size = CONFIG_INT(__MAX_ARRAY_SIZE__);
 
   int count, i;
-  const char *func = nullptr;
-  object_t **list;
-  array_t *ret;
-  funptr_t *f = nullptr;
+  const char* func = nullptr;
+  object_t** list;
+  array_t* ret;
+  funptr_t* f = nullptr;
 
   int num_arg = st_num_arg;
 
@@ -2026,7 +2127,7 @@ void f_objects(void) {
      * abort and return the_null_array.
      */
     for (i = 0; i < count; i++) {
-      svalue_t *v;
+      svalue_t* v;
 
       push_object(list[i]);
       if (f) {

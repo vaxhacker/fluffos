@@ -1,5 +1,4 @@
 ---
-layout: doc
 title: async / async_write
 ---
 # async_write
@@ -11,6 +10,7 @@ title: async / async_write
 ### SYNOPSIS
 
     void async_write( string file, string str, int flag, function callback );
+    promise async_write( string file, string str, int flag );
 
 ### DESCRIPTION
 
@@ -26,6 +26,17 @@ title: async / async_write
             // -1 for failure
             //  0 for success
         }
+
+
+    With the callback OMITTED, returns a promise instead: fulfilled (with
+    undefined) on success, rejected with the negative int the callback
+    would have received on failure -- `await async_write(f, data, 1);`.
+
+### NOTE
+
+    When the 'this_player in call_out' driver setting is enabled,
+    this_player() inside the callback is preserved from the time the
+    request was made, like call_out().
 
 ### SEE ALSO
 

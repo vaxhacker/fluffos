@@ -1,0 +1,82 @@
+#!/usr/bin/env node
+// Run the LPC testsuite inside the WASM driver under node — the
+// equivalent of `driver etc/config.test -ftest` for the web build.
+//
+// Usage: node tools/wasm/run-testsuite.js [build-wasm/src] [testsuite]
+//
+// Exits 0 when the driver's test run exits cleanly, nonzero otherwise
+// (same contract as the native ctest `testsuite` entry).
+
+const fs = require('fs');
+const path = require('path');
+
+const buildDir = path.resolve(process.argv[2] || path.join(__dirname, '../../build-wasm/src'));
+const suiteDir = path.resolve(process.argv[3] || path.join(__dirname, '../../testsuite'));
+
+const createFluffOS = require(path.join(buildDir, 'fluffos.js'));
+
+function copyDir(Module, src, dst) {
+  try { Module.FS.mkdir(dst); } catch (e) { /* exists */ }
+  for (const e of fs.readdirSync(src, { withFileTypes: true })) {
+    const s = path.join(src, e.name);
+    const d = dst + '/' + e.name;
+    if (e.isDirectory()) copyDir(Module, s, d);
+    else if (e.isFile()) Module.FS.writeFile(d, fs.readFileSync(s));
+  }
+}
+
+(async () => {
+  const Module = await createFluffOS({
+    // Old emscripten glue prefers fetch() under node 18+; hand it the
+    // binary directly instead.
+    wasmBinary: fs.readFileSync(path.join(buildDir, 'fluffos.wasm')),
+    print: (s) => console.log(s),
+    printErr: (s) => console.log(s),
+  });
+
+  copyDir(Module, suiteDir, '/testsuite');
+  Module.FS.chdir('/testsuite');
+  Module.fluffos = { onOutput: () => {}, onDisconnect: () => {} };
+
+  const rc = Module.ccall('fluffos_boot', 'number', ['string'], ['etc/config.test']);
+  if (rc !== 0) {
+    console.error('boot failed:', rc);
+    process.exit(1);
+  }
+
+  try {
+    const code = Module.ccall('fluffos_flag', 'number', ['string'], ['test']);
+    // master::flag() returning is not the end of the run. The suite's
+    // deferred checks live in call_outs, and anything after an `await` that
+    // parked only resumes once the microtask drain runs -- both are tick
+    // work, and the native driver gets them from its backend loop after
+    // flag() returns. Pump the host clock so they happen here too;
+    // otherwise every async suspend/resume assertion silently never runs.
+    // The suite ends by calling shutdown(), which surfaces as ExitStatus
+    // from a tick; the bound is just a stuck-run backstop.
+    let now = 0;
+    for (let i = 0; i < 20000; i++) {
+      const delay = Module.ccall('fluffos_tick', 'number', ['number'], [now]);
+      now += Math.max(1, Math.min(1000, delay > 0 ? delay : 1));
+    }
+    // Reaching here means the backstop exhausted without the driver ever
+    // shutting down (no ExitStatus was thrown). A wedged post-run phase is
+    // exactly what this suite exists to catch, so never fall through to
+    // fluffos_flag's return code -- that only reflects the counted checks
+    // and would report success for a run whose deferred checks never ran.
+    console.error('wasm testsuite: post-run tick pump exhausted without ' +
+                  'shutdown -- deferred checks did not complete ' +
+                  '(fluffos_flag rc=' + code + ')');
+    process.exit(3);
+  } catch (e) {
+    // The test runner finishes by shutting the driver down: exit() inside
+    // the wasm runtime surfaces here as an ExitStatus.
+    if (e && e.name === 'ExitStatus') {
+      process.exit(e.status === 0 ? 0 : 1);
+    }
+    throw e;
+  }
+})().catch((e) => {
+  console.error('run-testsuite failed:', e);
+  process.exit(1);
+});

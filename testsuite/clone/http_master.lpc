@@ -1,0 +1,32 @@
+// Local integration harness only; never used by etc/config.test.
+inherit "/single/master";
+
+mixed valid_http(string url, object caller) {
+  if (strsrch(url, "/gate-promise") != -1) return promise_create();
+  if (strsrch(url, "/gate-denied") != -1) return 0;
+  return caller && file_name(caller) == "/clone/http_client";
+}
+
+void flag(string flag) {
+  int port, tls_port, untrusted_port;
+  if (sscanf(flag, "http:%d:%d:%d", port, tls_port, untrusted_port) != 3) {
+    ::flag(flag);
+    return;
+  }
+  call_out(function(int port, int tls_port, int untrusted_port) {
+    promise_then("/clone/http_client"->run(port, tls_port, untrusted_port),
+      function(mixed result) {
+        string *failures = "/single/master"->query_failures();
+        if (sizeof(failures)) {
+          debug_message(sprintf("HTTP integration failures: %O\n", failures));
+          shutdown(1);
+        }
+        debug_message("HTTP integration checks succeeded.\n");
+        shutdown(0);
+      }, function(mixed reason) {
+        debug_message(sprintf("HTTP integration rejected: %O\n", reason));
+        shutdown(1);
+      });
+  }, 0, port, tls_port, untrusted_port);
+  call_out(function() { debug_message("HTTP integration watchdog expired.\n"); shutdown(1); }, 30);
+}

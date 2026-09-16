@@ -1,0 +1,55 @@
+// Default suite deliberately makes no outbound requests: the host list is empty.
+#ifdef __PACKAGE_HTTP__
+async void denied_requests() {
+  string *methods = ({ "GET", "POST", "PUT", "DELETE", "HEAD" });
+  for (int i = 0; i < sizeof(methods); i++) {
+    string method = methods[i];
+    mixed reason = acatch(await http_request("http://127.0.0.1:5984/world", ([
+      "method": method, "headers": ([ "Content-Type": "application/json" ]),
+      "body": to_buffer("{}"), "timeout": 100, "max_body": 100, "follow": 1,
+      "text": 0,
+    ])));
+    ASSERT2(mapp(reason), sprintf("rejection: %O", reason));
+    ASSERT_EQ("denied", reason["error"]);
+    ASSERT(stringp(reason["message"]));
+  }
+  mixed reason = acatch(await http_request("https://example.invalid/"));
+  ASSERT_EQ("denied", reason["error"]);
+}
+#endif
+
+void do_tests() {
+#ifdef __PACKAGE_HTTP__
+  foreach (mapping opts in ({
+    ([ "method": 1 ]), ([ "method": "RAW" ]), ([ "method": "GET\r\nX: y" ]),
+    ([ "headers": ({}) ]), ([ "headers": ([ 1: "x" ]) ]),
+    ([ "headers": ([ "x": 1 ]) ]), ([ "headers": ([ "bad name": "x" ]) ]),
+    ([ "headers": ([ "x": "y\r\nz: a" ]) ]),
+    ([ "headers": ([ "Content-Length": "10" ]) ]),
+    ([ "headers": ([ "Host": "elsewhere" ]) ]),
+    ([ "headers": ([ "X-Test": "a", "x-test": "b" ]) ]),
+    ([ "body": ({ 1 }) ]), ([ "timeout": 0 ]), ([ "timeout": 2147483648 ]),
+    ([ "max_body": -1 ]), ([ "max_body": 4294967296 ]),
+    ([ "follow": "yes" ]), ([ "text": 2 ]), ([ "protocol": "ws" ]),
+    ([ "typo": 1 ]), ([ 1: 1 ]),
+  })) {
+    ASSERT(catch(http_request("http://127.0.0.1:5984/", opts)));
+  }
+  foreach (string url in ({ "", "file:///etc/passwd", "ws://localhost/",
+    "http://user:pass@localhost/", "http://localhost:99999/",
+    "http://localhost/\r\nInjected: yes" })) {
+    ASSERT(catch(http_request(url)));
+  }
+  EXPECT_LATCH("HTTP denied by default");
+  promise_then(denied_requests(), function(mixed unused) {
+    RELEASE_LATCH("HTTP denied by default");
+  }, function(mixed err) {
+    ASSERT2(0, sprintf("HTTP checks failed: %O", err));
+    RELEASE_LATCH("HTTP denied by default");
+  });
+  // Like async_read, consumer settlement is allowed, but does not cancel I/O.
+  promise p = http_request("http://127.0.0.1:5984/");
+  promise_resolve(p, 7);
+  ASSERT_EQ(7, promise_result(p));
+#endif
+}

@@ -1,0 +1,127 @@
+#ifdef __PACKAGE_HTTP__
+async mixed rejected(string url, mapping opts) {
+  mixed reason = acatch(await http_request(url, opts));
+  ASSERT(mapp(reason));
+  return reason;
+}
+
+async void run(int port, int tls_port, int untrusted_port) {
+  string base = sprintf("http://127.0.0.1:%d", port);
+  mapping r, e;
+  r = await http_request(base + "/ok");
+  ASSERT_EQ(200, r["status"]);
+  ASSERT(bufferp(r["body"]));
+  ASSERT_EQ("hello", read_buffer(r["body"]));
+  ASSERT_EQ("custom", r["headers"]["x-test"]);
+  ASSERT_EQ("\"revision\"", r["headers"]["etag"]);
+  ASSERT_EQ(base + "/ok", r["url"]);
+  ASSERT(intp(r["ms"]) && r["ms"] >= 0);
+
+  int *statuses = ({ 404, 409, 500 });
+  for (int i = 0; i < sizeof(statuses); i++) {
+    int status = statuses[i];
+    r = await http_request(base + "/status/" + status);
+    ASSERT_EQ(status, r["status"]);
+  }
+  string *methods = ({ "POST", "PUT", "DELETE" });
+  for (int i = 0; i < sizeof(methods); i++) {
+    string method = methods[i];
+    buffer body = to_buffer(({ 0, 255, 65, 13, 10 }));
+    r = await http_request(base + "/echo", ([ "method": method, "body": body,
+      "headers": ([ "Content-Type": "application/octet-stream" ]) ]));
+    ASSERT_EQ(method, r["headers"]["x-method"]);
+    ASSERT_EQ(body, r["body"]);
+  }
+  r = await http_request(base + "/echo", ([ "method": "POST", "body": "hello" ]));
+  ASSERT_EQ(to_buffer("hello"), r["body"]);
+  r = await http_request(base + "/echo", ([ "method": "PUT", "body": to_buffer(({})) ]));
+  ASSERT_EQ(0, sizeof(r["body"]));
+  r = await http_request(
+    base + "/echo",
+    ([ "method": "POST", "body": repeat_string("x", 180000) ])
+  );
+  ASSERT_EQ(180000, sizeof(r["body"]));
+  r = await http_request(base + "/oversize", ([ "method": "HEAD", "max_body": 0 ]));
+  ASSERT_EQ(200, r["status"]);
+  ASSERT_EQ(0, sizeof(r["body"]));
+  r = await http_request(base + "/ok", ([ "text": 1 ]));
+  ASSERT_EQ("hello", r["body"]);
+  r = await http_request(base + "/binary");
+  ASSERT_EQ(to_buffer(({ 0, 255, 65 })), r["body"]);
+  r = await http_request(base + "/large");
+  ASSERT_EQ(250001, sizeof(r["body"]));
+  r = await http_request(base + "/chunked");
+  ASSERT_EQ(70000, sizeof(r["body"]));
+  r = await http_request(base + "/eof");
+  ASSERT_EQ("until EOF", read_buffer(r["body"]));
+  string *endpoints = ({ "/oversize", "/chunk-big" });
+  for (int i = 0; i < sizeof(endpoints); i++) {
+    string endpoint = endpoints[i];
+    e = await rejected(base + endpoint, ([]));
+    ASSERT_EQ("too_large", e["error"]);
+  }
+  e = await rejected(base + "/large", ([ "text": 1 ]));
+  ASSERT_EQ("too_large", e["error"]);
+  e = await rejected(base + "/ok", ([ "max_body": 4 ]));
+  ASSERT_EQ("too_large", e["error"]);
+  e = await rejected(base + "/truncated", ([]));
+  ASSERT_EQ("connect", e["error"]);
+  e = await rejected(base + "/slow", ([ "timeout": 50 ]));
+  ASSERT_EQ("timeout", e["error"]);
+
+  // Independent requests, including a slow one, must not hold up fast I/O.
+  promise slow = http_request(base + "/slow");
+  promise fast = http_request(base + "/ok");
+  r = await fast;
+  ASSERT_EQ(200, r["status"]);
+  ASSERT_EQ(0, promise_status(slow));
+  r = await slow;
+  ASSERT_EQ(200, r["status"]);
+
+  r = await http_request(base + "/redirect");
+  ASSERT_EQ(302, r["status"]);
+  r = await http_request(base + "/redirect", ([ "follow": 1 ]));
+  ASSERT_EQ(200, r["status"]);
+  ASSERT_EQ(base + "/ok", r["url"]);
+  r = await http_request(base + "/redirect307", ([ "method": "PUT", "body": "kept", "follow": 1 ]));
+  ASSERT_EQ("PUT", r["headers"]["x-method"]);
+  ASSERT_EQ("kept", read_buffer(r["body"]));
+  r = await http_request(
+    base + "/redirect303",
+    ([ "method": "POST", "body": "dropped", "follow": 1 ])
+  );
+  ASSERT_EQ("GET", r["headers"]["x-method"]);
+  ASSERT_EQ(0, sizeof(r["body"]));
+  endpoints = ({ "/gate-denied", "/gate-promise", "/redirect-denied", "/redirect-host", "/loop" });
+  for (int i = 0; i < sizeof(endpoints); i++) {
+    string endpoint = endpoints[i];
+    e = await rejected(base + endpoint, ([ "follow": 1 ]));
+    ASSERT_EQ("denied", e["error"]);
+  }
+  r = await http_request(sprintf("http://localhost:%d/cross-origin", port), ([
+    "follow": 1, "headers": ([ "Authorization": "secret", "Cookie": "secret" ])
+  ]));
+  ASSERT_EQ("|", read_buffer(r["body"]));
+  e = await rejected("http://x.invalid:80/", ([]));
+  ASSERT_EQ("dns", e["error"]);
+  e = await rejected("http://127.0.0.1:1/", ([]));
+  ASSERT_EQ("connect", e["error"]);
+  r = await http_request(sprintf("https://localhost:%d/ok", tls_port));
+  ASSERT_EQ(200, r["status"]);
+  e = await rejected(sprintf("https://localhost:%d/ok", untrusted_port), ([]));
+  ASSERT_EQ("tls", e["error"]);
+  e = await rejected(sprintf("https://localhost:%d/downgrade", tls_port), ([ "follow": 1 ]));
+  ASSERT_EQ("denied", e["error"]);
+
+  // Check off-graph promise/caller references while the exchange is pending.
+  slow = http_request(base + "/slow");
+#ifdef __DEBUGMALLOC_EXTENSIONS__
+  string leaks = check_memory();
+  ASSERT2(sizeof(filter(explode(leaks, "\n"), (: $1 && $1[0] :))) == 1, leaks);
+#endif
+  r = await slow;
+  // Shutdown with live I/O exercises cancellation and request ref teardown.
+  http_request(base + "/linger");
+  await call_out(0.05);
+}
+#endif

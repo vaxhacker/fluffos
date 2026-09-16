@@ -140,6 +140,7 @@ Package matrix (`src/CMakeLists.txt` forces these under `EMSCRIPTEN`):
 | db | off | MySQL/SQLite/PG client libs |
 | crypto | off | OpenSSL EVP (see §5: sha1 stays) |
 | ffi | off | libffi + dlopen |
+| http | off | native libwebsockets/libevent client; browser requests use jsbridge |
 | **pcre** | **on** | libpcre 8.x cross-built into the wasm-deps prefix by `tools/wasm/build-deps.sh`; all `pcre_*` efuns work |
 
 DNS (`packages/core/dns.cc`): the resolver half is a synthetic resolver

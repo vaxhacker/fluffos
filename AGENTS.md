@@ -465,6 +465,7 @@ All third-party libraries are vendored as full source trees. Lessons from the 20
 * **Positional aggregate initializers of vendor structs are a trap across upgrades** (lws inserted a bitfield mid-`lws_http_mount`, silently shifting every later positional field). Use field-by-field init for vendor structs in FluffOS code.
 
 ### Current FluffOS-local patches (keep across future updates unless obsolete upstream)
+* **libwebsockets** `lib/tls/openssl/openssl-client.c`: skip the ALPN `memcpy` when OpenSSL reports no selected protocol (`NULL`, length 0). HTTPS HTTP/1.1 peers without ALPN triggered UBSan's nonnull check; `tools/test_http.py` exercises that handshake under sanitizers.
 * **backward-cpp** `BackwardConfig.cmake`: static-link set `elf/dl/lzma/bz2/zstd` alongside `dw` (elfutils on modern distros), PUBLIC propagation through static `libdriver`, WIN32 `dbghelp`/`psapi` (no msvcr!), cmake_minimum_required bump.
 * **backward-cpp** `backward.hpp`: `<dlfcn.h>` under the `BACKWARD_HAS_DW` and backtrace branches (musl), `_MSC_VER` guard around `_set_abort_behavior()` (MinGW).
 * **libwebsockets** `CMakeLists.txt`: configure probes spelled `int main(void)` (clang 18+; still `void main` upstream as of v4.5-stable).

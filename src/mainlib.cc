@@ -33,6 +33,9 @@
 #include "base/internal/tracing.h"
 #include "thirdparty/scope_guard/scope_guard.hpp"
 #include "packages/core/dns.h"  // for init_dns_event_base.
+#ifdef PACKAGE_HTTP
+#include "packages/http/http.h"
+#endif
 #include "vm/vm.h"              // for push_constant_string, etc
 #include "comm.h"               // for init_user_conn
 #include "backend.h"            // for backend();
@@ -247,6 +250,9 @@ struct event_base* init_main(std::string_view config_file) {
   // Initialize libevent, This should be done before executing LPC.
   auto* base = init_backend();
   init_dns_event_base(base);
+#ifdef PACKAGE_HTTP
+  init_http(base);
+#endif
 
   // Initialize VM layer
   vm_init();

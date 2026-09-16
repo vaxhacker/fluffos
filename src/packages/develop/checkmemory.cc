@@ -31,6 +31,9 @@
 #ifdef PACKAGE_FFI
 #include "packages/ffi/ffi.h"
 #endif
+#ifdef PACKAGE_HTTP
+#include "packages/http/http.h"
+#endif
 #ifdef PACKAGE_ASYNC
 #include "packages/async/async.h"
 #endif
@@ -737,6 +740,9 @@ void check_all_blocks(int flag) {
     mark_call_outs();
     mark_dns_requests();
     mark_promise_queue();
+#ifdef PACKAGE_HTTP
+    mark_http_requests();
+#endif
 #ifdef PACKAGE_FFI
     mark_ffi();
 #endif

@@ -46,6 +46,9 @@ void db_cleanup(void);  // FIXME
 #ifdef PACKAGE_FFI
 #include "packages/ffi/ffi.h"
 #endif
+#ifdef PACKAGE_HTTP
+#include "packages/http/http.h"
+#endif
 #ifdef PACKAGE_JSBRIDGE
 #include "packages/jsbridge/jsbridge.h"
 #endif
@@ -95,6 +98,9 @@ void shutdownMudOS(int exit_code) {
 #endif
 #ifdef PACKAGE_FFI
   ffi_cleanup();
+#endif
+#ifdef PACKAGE_HTTP
+  http_cleanup();
 #endif
 #ifdef PACKAGE_JSBRIDGE
   // Must precede clear_tick_events(): pending delivery events reference

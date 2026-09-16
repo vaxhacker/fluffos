@@ -197,6 +197,18 @@ they always match the options it actually recognizes.
 | `writable os environment variables` | string | — | Colon-separated allow-list of environment variable names that set_os_env() may modify "
      "(package_contrib); these are implicitly readable. Empty (the default) denies all writes. |
 
+### HTTP Client
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `http default timeout` | int | 15000 | Default http_request() deadline in milliseconds, including DNS and redirects. _(min 1)_ |
+| `http max body` | int | 400000 | Maximum HTTP response body in bytes. Requests may lower this ceiling with max_body; the "
+     "maximum buffer size (or maximum string length for text) also applies. Overflow rejects "
+     "with too_large rather than truncating. |
+| `http allowed hosts` | string | — | Whitespace- or comma-separated list of exact host:port authorities permitted by "
+     "http_request(), for example 127.0.0.1:5984 or db.example:443. Use brackets for IPv6. "
+     "Empty denies all requests. Every request and redirect also requires valid_http approval. |
+
 ## Ports and Connections
 
 The listening ports are configured with numbered `external_port_N` entries

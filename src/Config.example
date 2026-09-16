@@ -306,3 +306,9 @@ enable mssp : 1
 enable msp : 1
 enable msdp : 0
 
+# Optional outbound HTTP client (PACKAGE_HTTP). Empty denies every request.
+# Comma or whitespace separated, exact host:port entries; valid_http must approve too.
+http allowed hosts :
+# Example: http allowed hosts : 127.0.0.1:5984 db.example:443
+http default timeout : 15000
+http max body : 400000

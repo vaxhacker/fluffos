@@ -56,6 +56,32 @@ void strings_and_buffers() {
   ASSERT(catch(efun::json_decode(allocate_buffer(0))));
 }
 
+void computed_integers() {
+  int count, negative;
+  mapping counts = ([]);
+  mixed *items = allocate(1);
+  mixed decoded = efun::json_decode("null");
+  // Numeric mutations can retain the undefined subtype of the initial zero.
+  // Once nonzero, these values are ordinary integers according to undefinedp.
+  count++;
+  negative--;
+  counts["visits"]++;
+  items[0]++;
+  decoded += 7;
+  ASSERT(!undefinedp(count));
+  ASSERT(!undefinedp(negative));
+  ASSERT(!undefinedp(counts["visits"]));
+  ASSERT_EQ("1", efun::json_encode(count));
+  ASSERT_EQ("-1", efun::json_encode(negative));
+  ASSERT_EQ("{\"visits\":1}", efun::json_encode(counts));
+  ASSERT_EQ("[1]", efun::json_encode(items));
+  ASSERT_EQ("7", efun::json_encode(decoded));
+  ASSERT_EQ(([ "count": 1, "negative": -1, "counts": ([ "visits": 1 ]), "items": ({ 1 }) ]),
+    efun::json_decode(efun::json_encode(([
+      "count": count, "negative": negative, "counts": counts, "items": items
+    ]))));
+}
+
 void saved_records() {
   // A blueprint/delta/inventory tree, including an explicitly false flag,
   // absent optional fields, Unicode prose, and precise fractional metadata.
@@ -182,6 +208,7 @@ void allocation_limits() {
 
 void do_tests() {
   primitives();
+  computed_integers();
   strings_and_buffers();
   saved_records();
   invalid_values();

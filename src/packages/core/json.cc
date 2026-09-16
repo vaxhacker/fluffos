@@ -198,7 +198,11 @@ class JsonEncoder {
   void encode(const svalue_t* value, size_t depth) {
     switch (value->type) {
       case T_NUMBER:
-        append(value->subtype & T_UNDEFINED ? "null" : std::to_string(value->u.number));
+        // Increment/decrement may retain a zero's undefined subtype. Match
+        // undefinedp(): a nonzero integer is defined regardless of that tag.
+        append(value->u.number == 0 && value->subtype == T_UNDEFINED
+                   ? "null"
+                   : std::to_string(value->u.number));
         return;
       case T_REAL:
         if (!std::isfinite(value->u.real)) {

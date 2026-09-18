@@ -144,7 +144,7 @@ struct Request {
   unsigned redirects = 0;
   bool text = false, follow = false, has_body = false;
   bool started = false, resolved = false, finished = false, queued = false;
-  bool eof_body = false, sent_headers = false;
+  bool eof_body = false, sent_headers = false, rearm_pending = false;
   std::vector<std::string> addresses;
   size_t next_address = 0;
   Clock::time_point begin = Clock::now();
@@ -170,6 +170,7 @@ uint64_t next_id = 0;
 std::map<uint64_t, std::unique_ptr<Request>> requests;
 
 void dispatch(uint64_t id);
+void rearm(uint64_t id);
 void queue(Request& r) {
   if (stopping || r.queued) return;
   r.queued = true;
@@ -332,8 +333,16 @@ int callback(lws* wsi, lws_callback_reasons reason, void*, void* in, size_t len)
       break;
     }
     case LWS_CALLBACK_CLIENT_HTTP_WRITEABLE: {
-      // A choked write is buffered by lws. Drain until then; rearming from
-      // inside this callback loses POLLOUT with lws's libevent integration.
+      // lws_write() never returns short: a partial send is buffered by lws,
+      // which re-arms POLLOUT itself and calls back here once it has drained.
+      // A choke can also be reported with nothing buffered (the kernel took
+      // the whole chunk but the send queue is now past its POLLOUT mark).
+      // lws leaves the body wait to "user code" in that case, so the request
+      // must ask for the next writable callback itself or it sits until the
+      // deadline; bodies above the socket send buffer stalled this way.
+      // Asking from inside this callback is unreliable with lws's libevent
+      // integration (the wakeup only arrives with lws's periodic service),
+      // so the request is re-armed from the driver's own event loop instead.
       while (r->sent < r->body.size()) {
         size_t n = std::min(size_t(16384), r->body.size() - r->sent);
         unsigned char data[LWS_PRE + 16384];
@@ -347,6 +356,10 @@ int callback(lws* wsi, lws_callback_reasons reason, void*, void* in, size_t len)
         r->sent += n;
         if (last) lws_client_http_body_pending(wsi, 0);
         if (lws_send_pipe_choked(wsi)) break;
+      }
+      if (r->sent < r->body.size() && !r->rearm_pending) {
+        r->rearm_pending = true;
+        add_walltime_event(std::chrono::milliseconds(0), [id = r->id] { rearm(id); });
       }
       break;
     }
@@ -603,6 +616,14 @@ void progress(Request& r) {
   }
   if (!r.started) start(r);
   else if (r.resolved && !r.wsi) connect(r);
+}
+
+void rearm(uint64_t id) {
+  auto it = requests.find(id);
+  if (stopping || it == requests.end()) return;
+  auto& r = *it->second;
+  r.rearm_pending = false;
+  if (r.wsi && !r.finished && r.sent < r.body.size()) lws_callback_on_writable(r.wsi);
 }
 
 void dispatch(uint64_t id) {

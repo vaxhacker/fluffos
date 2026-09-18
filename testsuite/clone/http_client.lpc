@@ -41,6 +41,12 @@ async void run(int port, int tls_port, int untrusted_port) {
     ([ "method": "POST", "body": repeat_string("x", 180000) ])
   );
   ASSERT_EQ(180000, sizeof(r["body"]));
+  // A body far above the socket send buffer: the peer delays reading so the
+  // first write chokes, which used to leave the upload stalled until the
+  // deadline because the writable callback was never re-armed.
+  r = await http_request(base + "/upload", ([ "method": "POST", "body": allocate_buffer(6000000) ]));
+  ASSERT_EQ(200, r["status"]);
+  ASSERT_EQ("6000000", read_buffer(r["body"]));
   r = await http_request(base + "/oversize", ([ "method": "HEAD", "max_body": 0 ]));
   ASSERT_EQ(200, r["status"]);
   ASSERT_EQ(0, sizeof(r["body"]));

@@ -28,6 +28,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_request(self):
         path = self.path.split("?", 1)[0]
         self.server.seen.append(path)
+        if path == "/upload":
+            # Let the client's socket send buffer fill before draining it: a
+            # body above that buffer used to stall after the first choked
+            # write until the request deadline.
+            time.sleep(1)
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         if path.startswith("/gate-"):
             raise AssertionError("Access gate was bypassed")
@@ -51,6 +56,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/echo":
             payload = body
             extra["X-Method"] = self.command
+        elif path == "/upload":
+            payload = str(len(body)).encode()
         elif path == "/binary":
             payload = b"\0\xffA"
         elif path == "/large":
@@ -140,6 +147,9 @@ def main():
             f"127.0.0.1:{port}", f"localhost:{port}", f"localhost:{tls_port}",
             f"localhost:{bad_port}", "127.0.0.1:1", "x.invalid:80",
         ]))
+        # The upload check needs a request body far above the socket send
+        # buffer; the response caps ("http max body") are left as configured.
+        config = config.replace("maximum buffer size : 400000", "maximum buffer size : 8000000")
         config += "\nport number : 0\n"
         cfg = root / "http.cfg"
         cfg.write_text(config)

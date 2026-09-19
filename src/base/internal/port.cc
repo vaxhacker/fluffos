@@ -5,6 +5,7 @@
 #include "base/internal/rc.h"
 #include "base/internal/rusage.h"
 
+#include <chrono>
 #include <random>
 #include <unistd.h>
 #include <cstring>
@@ -71,15 +72,16 @@ void get_usec_clock(long* sec, long* usec) {
   *usec = tv.tv_usec;
 }
 
+/* The PROFILE_FUNCTIONS clock, read on every LPC function entry and exit.
+ * Historically getrusage(): two syscalls per call, and a resolution the
+ * kernel only promises per scheduler tick. The steady clock is a vDSO read
+ * with real microseconds, and elapsed time is what a mud profile is for:
+ * a function that waits on the disk is expensive whoever gets the CPU. */
 long get_cpu_times(unsigned long* secs, unsigned long* usecs) {
-  struct rusage rus{};
-
-  if (getrusage(RUSAGE_SELF, &rus) < 0) {
-    return 0;
-  }
-  *secs = rus.ru_utime.tv_sec + rus.ru_stime.tv_sec;
-  *usecs = rus.ru_utime.tv_usec + rus.ru_stime.tv_usec;
-
+  auto now = std::chrono::steady_clock::now().time_since_epoch();
+  auto us = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
+  *secs = us / 1000000;
+  *usecs = us % 1000000;
   return 1;
 }
 

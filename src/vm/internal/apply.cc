@@ -293,6 +293,14 @@ retry_for_shadow:
             caller_type = ORIGIN_LOCAL;
             csp->pc = pc;
             csp->num_local_variables = 0;
+            // A FRAME_FUNCTION names its function: pop_control_stack()'s profile and the
+            // tracer's frame name both read function_table[table_index], and a stale index
+            // left in this recycled slot read past the table (PROFILE_FUNCTIONS segfault).
+            csp->fr.table_index = funcp->default_args_findex[i];
+#ifdef PROFILE_FUNCTIONS
+            get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
+            default_funcp->calls++;
+#endif
             current_prog = progp;
             call_program(progp, default_funcp->address);
 

@@ -40,6 +40,11 @@
 #define DEFAULT_PRAGMAS PRAGMA_WARNINGS + PRAGMA_SAVE_TYPES + PRAGMA_ERROR_CONTEXT + PRAGMA_OPTIMIZE
 #define SAVE_EXTENSION ".o"
 #define PRIVS
+/* PROFILE_FUNCTIONS: every LPC function keeps calls, self and children time,
+ * read and reset by function_profile(). The clock is the monotonic steady
+ * clock (port.cc get_cpu_times), not getrusage: a cheap vDSO read per call
+ * instead of a syscall, and microseconds that are real. */
+#define PROFILE_FUNCTIONS
 #undef NO_SHADOWS
 #undef USE_ICONV
 #undef IPV6

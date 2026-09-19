@@ -111,6 +111,6 @@ void add_mapping_malloced_string(mapping_t*, const char*, char*);
 void add_mapping_object(mapping_t*, const char*, object_t*);
 void add_mapping_array(mapping_t*, const char*, array_t*);
 void add_mapping_promise(mapping_t*, const char*, struct promise_t*);
-void add_mapping_shared_string(mapping_t*, const char*, char*);
+void add_mapping_shared_string(mapping_t*, const char*, const char*);
 
 #endif /* _MAPPING_H */

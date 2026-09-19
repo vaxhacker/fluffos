@@ -24,13 +24,19 @@ title: system / function_profile
            ([ "name"     : name_of_the_function,
               "calls"    : number_of_calls,
 
-              /* cpu time expressed in microseconds */
-              "self"     : cpu_time_spent_in self,
-              "children" : cpu_time_spent_in_children
+              /* elapsed time in microseconds */
+              "self"     : time_spent_in_self,
+              "children" : time_spent_in_children
            ])
-    The usefulness of this is tied to the resolution of the CPU clock--even
-    though  the  units  are microseconds, the CPU timer resolution is often
-    much less
+    Times are elapsed microseconds on the monotonic steady clock, read at
+    every function entry and exit, so time a function spends blocked (a file
+    read, a save) counts, as it does for the single-threaded game. "self"
+    excludes the time spent in the functions it called; "children" is that
+    time. Direct recursion is not counted as a child of itself.
+
+    Reading an object's profile resets its program's counters. Clones share
+    their blueprint's program, so one call covers every clone; an inherited
+    program's counters are read through the object it was loaded as.
 
 ### SEE ALSO
 

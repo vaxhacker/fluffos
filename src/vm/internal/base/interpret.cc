@@ -1776,6 +1776,10 @@ int fill_default_args(program_t* progp, function_t* funcp, int funflags, int num
     csp->pc = pc;
     csp->num_local_variables = 0;
     csp->fr.table_index = funcp->default_args_findex[i];
+#ifdef PROFILE_FUNCTIONS
+    get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
+    default_funcp->calls++;
+#endif
     current_prog = progp;
     call_program(progp, default_funcp->address);
 
@@ -1889,6 +1893,10 @@ function_t* setup_inherited_frame(int findex) {
 
   func_entry = current_prog->function_table + findex;
   csp->fr.table_index = findex;
+#ifdef PROFILE_FUNCTIONS
+  get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
+  current_prog->function_table[findex].calls++;
+#endif
   /* Remove excessive arguments */
   if (flags & FUNC_TRUE_VARARGS) {
     setup_varargs_variables(csp->num_local_variables, func_entry->num_local, func_entry->num_arg);

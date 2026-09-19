@@ -1341,7 +1341,7 @@ void add_mapping_array(mapping_t* m, const char* key, array_t* value) {
   value->ref++;
 }
 
-void add_mapping_shared_string(mapping_t* m, const char* key, char* value) {
+void add_mapping_shared_string(mapping_t* m, const char* key, const char* value) {
   svalue_t* s;
 
   s = insert_in_mapping(m, key);

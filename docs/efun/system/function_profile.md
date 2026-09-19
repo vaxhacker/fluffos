@@ -38,7 +38,14 @@ title: system / function_profile
     their blueprint's program, so one call covers every clone; an inherited
     program's counters are read through the object it was loaded as.
 
+    The counters are compiled in by the PROFILE_FUNCTIONS build option (cmake
+    -DPROFILE_FUNCTIONS=ON|OFF) and accumulate only while they are switched on:
+    the driver's --profile argument starts counting at boot, and
+    function_profile_enable() starts and stops it at runtime. Counting costs
+    roughly a fifth of the time spent executing LPC; compiled in and switched
+    off costs a branch per call frame, a few percent.
+
 ### SEE ALSO
 
-    rusage(3), time_expression(3)
+    function_profile_enable(3), rusage(3), time_expression(3)
 

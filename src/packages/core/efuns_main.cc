@@ -671,6 +671,21 @@ void f_function_profile(void) {
 }
 #endif
 
+#ifdef F_FUNCTION_PROFILE_ENABLE
+/* The counters cost about a fifth of LPC execution time while they run, so a
+ * game that is not being profiled leaves them off and pays a branch per frame.
+ * Returns the previous state, so a caller can put it back. */
+void f_function_profile_enable(void) {
+  int was = profile_functions_on ? 1 : 0;
+  if (st_num_arg > 0) {
+    profile_functions_enable(sp->u.number != 0);
+    sp->u.number = was;   // the argument's slot carries the answer back
+  } else {
+    push_number(was);     // asked, not told
+  }
+}
+#endif
+
 #ifdef F_FUNCTION_EXISTS
 void f_function_exists() {
   const char* str;

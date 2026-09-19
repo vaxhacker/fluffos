@@ -339,6 +339,22 @@ int driver_main(int argc, char** argv) {
     }
   }
 
+  /* --profile: run with the per-function counters accumulating from the start,
+   * so a run's own boot is in the profile. Accepted whatever the build, so a
+   * runner can pass it to any driver; a driver without PROFILE_FUNCTIONS says
+   * so and carries on rather than refusing to start. */
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--profile") == 0) {
+#ifdef PROFILE_FUNCTIONS
+      profile_functions_enable(true);
+      debug_message("Function profiling on from the start (--profile).\n");
+#else
+      debug_message("--profile: this driver was built without PROFILE_FUNCTIONS.\n");
+#endif
+      break;
+    }
+  }
+
   DEFER { Tracer::collect(); };
 
   if (!trace_log.empty()) {
@@ -415,6 +431,9 @@ int driver_main(int argc, char** argv) {
         if (strcmp(argv[i], "--tracing") == 0) {
           i++;
           continue;
+        }
+        if (strcmp(argv[i], "--profile") == 0) {
+          continue;   // read in its own pass above
         }
         // fall-through
       default:

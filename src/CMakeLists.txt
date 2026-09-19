@@ -4,6 +4,9 @@ option(STATIC "Build static version of driver" OFF)
 option(USE_JEMALLOC "Build driver with jemalloc support" ON)
 option(ENABLE_SANITIZER "Build driver with sanitizer support" OFF)
 option(BUILD_FUZZERS "Build AFL++/libFuzzer investigation harnesses (not shipped functionality)" OFF)
+# Per-function call counts and timing, read by function_profile(). Compiled in
+# here; switched on at runtime by --profile or function_profile_enable().
+option(PROFILE_FUNCTIONS "per-function profiling counters" ON)
 # Packages
 option(PACKAGE_ASYNC "async package" ON)
 option(PACKAGE_COMPRESS "compress package" ON)

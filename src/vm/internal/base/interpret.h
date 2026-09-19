@@ -261,6 +261,17 @@ void pop_context(error_context_t*);
 void restore_context(error_context_t*);
 void save_context(error_context_t*);
 
+#ifdef PROFILE_FUNCTIONS
+/* Whether the per-function counters are actually accumulating. Compiled in by
+ * the PROFILE_FUNCTIONS build option, and off until asked: the driver's
+ * --profile argument, or function_profile_enable() from the mudlib. Off, a frame
+ * costs one branch each way; on, a clock read each way and the parent walk. */
+extern bool profile_functions_on;
+/* Turning it on stamps every frame already open, so their pops charge from here
+ * rather than from whatever the recycled slot held. */
+void profile_functions_enable(bool on);
+#endif
+
 void pop_control_stack(void);
 function_t* setup_new_frame(int);
 void push_control_stack(int);

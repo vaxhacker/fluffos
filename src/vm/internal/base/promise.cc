@@ -1199,7 +1199,9 @@ void resume_coroutine(lpc_coroutine_t* coro, promise_t* source) {
 #ifdef PROFILE_FUNCTIONS
   /* the suspension popped this frame and charged its time so far; the rebuilt
    * frame charges from the resume on. Not a new call: calls counted at entry. */
-  get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
+  if (profile_functions_on) {
+    get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
+  }
 #endif
   csp->num_local_variables = coro->num_local_variables;
   csp->defers = coro->defers;

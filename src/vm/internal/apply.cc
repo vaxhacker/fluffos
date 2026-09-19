@@ -298,8 +298,10 @@ retry_for_shadow:
             // left in this recycled slot read past the table (PROFILE_FUNCTIONS segfault).
             csp->fr.table_index = funcp->default_args_findex[i];
 #ifdef PROFILE_FUNCTIONS
-            get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
-            default_funcp->calls++;
+            if (profile_functions_on) {
+              get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
+              default_funcp->calls++;
+            }
 #endif
             current_prog = progp;
             call_program(progp, default_funcp->address);
@@ -351,8 +353,10 @@ retry_for_shadow:
     variable_index_offset = entry.variable_index_offset;
     csp->fr.table_index = findex;
 #ifdef PROFILE_FUNCTIONS
-    get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
-    current_prog->function_table[findex].calls++;
+    if (profile_functions_on) {
+      get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
+      current_prog->function_table[findex].calls++;
+    }
 #endif
     /* Setup variables */
     if (funflags & FUNC_TRUE_VARARGS) {

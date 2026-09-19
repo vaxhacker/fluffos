@@ -8,6 +8,7 @@
 
 // Features
 #cmakedefine DEBUG
+#cmakedefine PROFILE_FUNCTIONS
 #cmakedefine DEBUGMALLOC
 #ifdef DEBUGMALLOC
 #define DEBUGMALLOC_EXTENSIONS

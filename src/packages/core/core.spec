@@ -346,6 +346,9 @@ void clear_debug_level(string);
 
 #ifdef PROFILE_FUNCTIONS
 mapping *function_profile(object default:F__THIS_OBJECT);
+// Start or stop the counters; returns whether they were running before.
+// With no argument it only answers, changing nothing.
+int function_profile_enable(void | int);
 #endif
 
 int resolve(string, string | function);

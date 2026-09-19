@@ -1476,10 +1476,29 @@ void push_control_stack(int frkind) {
 
 extern int playerchanged;
 
+#ifdef PROFILE_FUNCTIONS
+bool profile_functions_on = false;
+
+void profile_functions_enable(bool on) {
+  if (on && !profile_functions_on) {
+    /* Frames already open were pushed without a stamp (or with a stale one from
+     * the slot's last use). Charge them from now, so the first pops after
+     * switching on report elapsed time instead of garbage. */
+    unsigned long secs = 0, usecs = 0;
+    get_cpu_times(&secs, &usecs);
+    for (control_stack_t* frame = control_stack; frame <= csp; frame++) {
+      frame->entry_secs = secs;
+      frame->entry_usecs = usecs;
+    }
+  }
+  profile_functions_on = on;
+}
+#endif
+
 void pop_control_stack() {
   DEBUG_CHECK(csp == (control_stack - 1), "Popped out of the control stack\n");
 #ifdef PROFILE_FUNCTIONS
-  if ((csp->framekind & FRAME_MASK) == FRAME_FUNCTION) {
+  if (profile_functions_on && (csp->framekind & FRAME_MASK) == FRAME_FUNCTION) {
     long secs, usecs, dsecs;
     function_t* cfp = &current_prog->function_table[csp->fr.table_index];
     int stof = 0;
@@ -1777,8 +1796,10 @@ int fill_default_args(program_t* progp, function_t* funcp, int funflags, int num
     csp->num_local_variables = 0;
     csp->fr.table_index = funcp->default_args_findex[i];
 #ifdef PROFILE_FUNCTIONS
-    get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
-    default_funcp->calls++;
+    if (profile_functions_on) {
+      get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
+      default_funcp->calls++;
+    }
 #endif
     current_prog = progp;
     call_program(progp, default_funcp->address);
@@ -1847,8 +1868,10 @@ function_t* setup_new_frame(int findex) {
   func_entry = current_prog->function_table + findex;
   csp->fr.table_index = findex;
 #ifdef PROFILE_FUNCTIONS
-  get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
-  current_prog->function_table[findex].calls++;
+  if (profile_functions_on) {
+    get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
+    current_prog->function_table[findex].calls++;
+  }
 #endif
 
   /* Remove excessive arguments */
@@ -1894,8 +1917,10 @@ function_t* setup_inherited_frame(int findex) {
   func_entry = current_prog->function_table + findex;
   csp->fr.table_index = findex;
 #ifdef PROFILE_FUNCTIONS
-  get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
-  current_prog->function_table[findex].calls++;
+  if (profile_functions_on) {
+    get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
+    current_prog->function_table[findex].calls++;
+  }
 #endif
   /* Remove excessive arguments */
   if (flags & FUNC_TRUE_VARARGS) {
@@ -4964,8 +4989,10 @@ void call___INIT(object_t* ob) {
   current_prog = progp;
   csp->fr.table_index = num_functions - 1;
 #ifdef PROFILE_FUNCTIONS
-  get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
-  current_prog->function_table[num_functions - 1].calls++;
+  if (profile_functions_on) {
+    get_cpu_times(&(csp->entry_secs), &(csp->entry_usecs));
+    current_prog->function_table[num_functions - 1].calls++;
+  }
 #endif
   caller_type = ORIGIN_DRIVER;
   csp->num_local_variables = 0;

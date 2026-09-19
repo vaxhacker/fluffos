@@ -339,15 +339,16 @@ int driver_main(int argc, char** argv) {
     }
   }
 
-  /* --profile: run with the per-function counters accumulating from the start,
-   * so a run's own boot is in the profile. Accepted whatever the build, so a
-   * runner can pass it to any driver; a driver without PROFILE_FUNCTIONS says
-   * so and carries on rather than refusing to start. */
+  /* --profile: THE gate for function profiling. Started with it, the counters
+   * run (and the mudlib may pause and resume them); started without it, nothing
+   * can turn them on, so the same binary runs a profiled wall and an unprofiled
+   * game. A driver built without PROFILE_FUNCTIONS says so and carries on. */
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--profile") == 0) {
 #ifdef PROFILE_FUNCTIONS
+      profile_functions_allowed = true;
       profile_functions_enable(true);
-      debug_message("Function profiling on from the start (--profile).\n");
+      debug_message("Function profiling on (--profile).\n");
 #else
       debug_message("--profile: this driver was built without PROFILE_FUNCTIONS.\n");
 #endif

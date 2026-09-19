@@ -676,7 +676,8 @@ void f_function_profile(void) {
  * game that is not being profiled leaves them off and pays a branch per frame.
  * Returns the previous state, so a caller can put it back. */
 void f_function_profile_enable(void) {
-  int was = profile_functions_on ? 1 : 0;
+  /* -1: the process was not started with --profile, and nothing can change that */
+  int was = !profile_functions_allowed ? -1 : profile_functions_on ? 1 : 0;
   if (st_num_arg > 0) {
     profile_functions_enable(sp->u.number != 0);
     sp->u.number = was;   // the argument's slot carries the answer back

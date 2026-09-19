@@ -346,7 +346,8 @@ void clear_debug_level(string);
 
 #ifdef PROFILE_FUNCTIONS
 mapping *function_profile(object default:F__THIS_OBJECT);
-// Start or stop the counters; returns whether they were running before.
+// Pause or resume the counters; returns the state before: 1 running, 0 paused,
+// -1 when the driver was not started with --profile (then nothing can start them).
 // With no argument it only answers, changing nothing.
 int function_profile_enable(void | int);
 #endif

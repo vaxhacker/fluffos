@@ -267,6 +267,11 @@ void save_context(error_context_t*);
  * --profile argument, or function_profile_enable() from the mudlib. Off, a frame
  * costs one branch each way; on, a clock read each way and the parent walk. */
 extern bool profile_functions_on;
+/* The master gate: set only by the driver's --profile argument. A process
+ * started without it cannot profile at all -- function_profile_enable() is
+ * refused -- so one binary serves a profiled test run and an unprofiled game,
+ * and nothing in the mudlib can tax a game that was not started to be profiled. */
+extern bool profile_functions_allowed;
 /* Turning it on stamps every frame already open, so their pops charge from here
  * rather than from whatever the recycled slot held. */
 void profile_functions_enable(bool on);

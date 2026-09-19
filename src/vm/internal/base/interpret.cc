@@ -1478,8 +1478,12 @@ extern int playerchanged;
 
 #ifdef PROFILE_FUNCTIONS
 bool profile_functions_on = false;
+bool profile_functions_allowed = false;
 
 void profile_functions_enable(bool on) {
+  if (on && !profile_functions_allowed) {
+    return; /* not started with --profile: the gate is shut, and stays shut */
+  }
   if (on && !profile_functions_on) {
     /* Frames already open were pushed without a stamp (or with a stale one from
      * the slot's last use). Charge them from now, so the first pops after

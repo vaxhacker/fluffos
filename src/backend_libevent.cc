@@ -71,11 +71,19 @@ inline struct timeval gametick_timeval() {
 }
 
 void on_game_tick(evutil_socket_t /*fd*/, short /*what*/, void* arg) {
-  backend_run_one_gametick();
-
+  // The next tick is due one gametick after this one began. Arm it before the
+  // tick's LPC runs: LPC that schedules a delayed timer refreshes libevent's
+  // cached time, and arming after that would count from when the LPC finished.
   auto* ev = *(reinterpret_cast<struct event**>(arg));
   auto t = gametick_timeval();
   event_add(ev, &t);
+
+  backend_run_one_gametick();
+
+  // libevent works out how long to wait for the next timer from its cached
+  // time. Left at this pass's start, a long tick would make the loop sleep that
+  // much past a tick already due.
+  event_base_update_cache_time(g_event_base);
 }
 
 void on_walltime_event(evutil_socket_t /*fd*/, short /*what*/, void* arg) {

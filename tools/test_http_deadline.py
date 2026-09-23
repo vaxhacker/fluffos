@@ -3,9 +3,12 @@
 
 Usage: python3 tools/test_http_deadline.py build-http/src/driver
 libevent measures a new timeout from the time it cached when the loop pass
-began. LPC burns 2 s of CPU, then makes an http_request with a 1000 ms timeout
-and a 0.5 s call_out_walltime. The request must reach the server and return
-200, and the call_out must wait its full delay.
+began. In separate passes, LPC burns 2 s of CPU and then makes only an
+http_request with a 1000 ms timeout, or only a 0.5 s call_out_walltime. The
+request must reach the server and return 200, and the call_out must wait its
+full delay. Then five heartbeats each run 150 ms of LPC, three of them also
+scheduling a delayed call_out_walltime; the heartbeats must keep their cadence
+(5 s + 5 x 50 ms = 5250 ms). Each tick that slips adds a gametick (100 ms).
 """
 import argparse
 import contextlib
@@ -63,7 +66,7 @@ def run_deadline(driver, log_path):
             try:
                 code = subprocess.run([str(driver), str(cfg), f"-fdeadline:{server.server_port}"],
                                       cwd=mudlib, stdout=log, stderr=subprocess.STDOUT,
-                                      timeout=20).returncode
+                                      timeout=40).returncode
             except subprocess.TimeoutExpired:
                 code = -1
         output = log_path.read_text(errors="replace")
@@ -72,13 +75,17 @@ def run_deadline(driver, log_path):
         http_ok = code == 0 and status is not None and status[1] == "status=200" and \
             server.seen == ["/ok"]
         callout_ok = callout is not None and int(callout[1]) >= 450
+        tick = re.search(r"DEADLINE TICK ms=(\d+)", output)
+        tick_ok = tick is not None and int(tick[1]) < 5350
         print(f"{'PASS' if http_ok else 'FAIL'} http_request after 2 s of LPC, timeout 1000 ms: "
               f"{' '.join(filter(None, status.groups())) if status else 'no result'}; server saw {len(server.seen)} request(s)")
         print(f"{'PASS' if callout_ok else 'FAIL'} call_out_walltime 0.5 s after 2 s of LPC: "
               f"fired after {callout[1] + ' ms' if callout else 'never'}")
-        if not (http_ok and callout_ok):
+        print(f"{'PASS' if tick_ok else 'FAIL'} five heartbeats each running 150 ms of LPC: "
+              f"{tick[1] + ' ms (cadence 5250; each slipped tick adds 100)' if tick else 'no result'}")
+        if not (http_ok and callout_ok and tick_ok):
             print(output[-1500:])
-        return http_ok and callout_ok
+        return http_ok and callout_ok and tick_ok
 
 
 def main():

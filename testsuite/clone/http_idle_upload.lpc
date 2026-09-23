@@ -1,0 +1,32 @@
+// One request per process, with no game tick during the exchange.
+// tools/test_http_idle_upload.py checks the bytes, timing and socket choke.
+inherit "/single/master";
+
+mixed valid_http(string url, object caller) { return caller == this_object(); }
+
+void upload(int port, int size) {
+  buffer body = allocate_buffer(size);
+  body[0] = 65;
+  body[<1] = 90;
+  promise_then(http_request(sprintf("http://127.0.0.1:%d/upload", port), ([
+    "method": "POST", "body": body, "timeout": 5000
+  ])), function(mapping r) {
+    debug_message(sprintf("IDLE UPLOAD status=%d bytes=%s ms=%d\n",
+      r["status"], read_buffer(r["body"]), r["ms"]));
+    shutdown(0);
+  }, function(mixed reason) {
+    debug_message(sprintf("IDLE UPLOAD rejected: %O\n", reason));
+    shutdown(1);
+  });
+}
+
+void flag(string arg) {
+  int port, size;
+  if (sscanf(arg, "upload:%d:%d", port, size) != 2) {
+    shutdown(2);
+    return;
+  }
+  // Let boot events settle. This one-shot has fired before the measured
+  // exchange begins; no LPC timer or other request can help it finish.
+  call_out_walltime((: upload :), 0.1, port, size);
+}

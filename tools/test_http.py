@@ -2,7 +2,8 @@
 """Exercise PACKAGE_HTTP against local HTTP/TLS servers, outside the LPC suite.
 
 Usage: python3 tools/test_http.py build-http/src/driver
-Only Python's standard library and the openssl executable are required.
+Python's standard library and openssl are required; the Linux idle-upload cases
+also use a C compiler to build a socket-buffer fixture.
 The mudlib and certificates are temporary; no CouchDB or websocket listener is needed.
 """
 import argparse
@@ -17,6 +18,8 @@ import subprocess
 import tempfile
 import threading
 import time
+
+from test_http_idle_upload import run_uploads
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -165,6 +168,8 @@ def main():
             print(output[-6000:])
             raise SystemExit(f"HTTP integration failed (exit {run.returncode}); see {args.log}")
         print(f"HTTP integration checks succeeded; log: {args.log}")
+    if not run_uploads(driver, args.log.with_suffix(".idle")):
+        raise SystemExit("Idle HTTP upload checks failed")
 
 
 if __name__ == "__main__":

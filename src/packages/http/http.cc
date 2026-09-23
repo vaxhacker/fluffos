@@ -726,6 +726,10 @@ void f_http_request() {
   }, &r);
   if (!r.timer) error("http_request: unable to allocate deadline.\n");
   timeval deadline{r.timeout / 1000, (r.timeout % 1000) * 1000};
+  // libevent measures a timeout from the time it cached when this loop pass
+  // began, and this LPC may have been running for longer than the timeout
+  // since. Measure it from now, or the deadline can have passed already.
+  event_base_update_cache_time(event_loop);
   if (evtimer_add(r.timer, &deadline)) error("http_request: unable to schedule deadline.\n");
   requests.emplace(r.id, std::move(request));
   if (!approved) fail(r, "denied", "HTTP request denied by access policy.");

@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 
+from test_http_deadline import run_deadline
 from test_http_idle_upload import run_uploads
 
 
@@ -170,6 +171,8 @@ def main():
         print(f"HTTP integration checks succeeded; log: {args.log}")
     if not run_uploads(driver, args.log.with_suffix(".idle")):
         raise SystemExit("Idle HTTP upload checks failed")
+    if not run_deadline(driver, args.log.with_suffix(".deadline")):
+        raise SystemExit("HTTP deadline checks failed")
 
 
 if __name__ == "__main__":

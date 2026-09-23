@@ -1,0 +1,42 @@
+// A request and a wall-time call_out made after LPC has run longer than their
+// timeouts in one execution. tools/test_http_deadline.py checks both still
+// get their full time.
+inherit "/single/master";
+
+int pending = 2, failed;
+
+mixed valid_http(string url, object caller) { return caller == this_object(); }
+
+void done() {
+  if (!--pending) shutdown(failed);
+}
+
+void callout_fired(int armed) {
+  debug_message(sprintf("DEADLINE CALLOUT ms=%d\n", (perf_counter_ns() - armed) / 1000000));
+  done();
+}
+
+void burn_then_request(int port) {
+  int start = perf_counter_ns();
+  // Longer than both timeouts below, with no return to the event loop.
+  while (perf_counter_ns() - start < 2000000000);
+  call_out_walltime("callout_fired", 0.5, perf_counter_ns());
+  promise_then(http_request(sprintf("http://127.0.0.1:%d/ok", port), ([ "timeout": 1000 ])),
+    function(mapping r) {
+      debug_message(sprintf("DEADLINE HTTP status=%d\n", r["status"]));
+      done();
+    }, function(mixed reason) {
+      debug_message(sprintf("DEADLINE HTTP rejected: %O\n", reason));
+      failed = 1;
+      done();
+    });
+}
+
+void flag(string arg) {
+  int port;
+  if (sscanf(arg, "deadline:%d", port) != 1) {
+    shutdown(2);
+    return;
+  }
+  call_out_walltime((: burn_then_request :), 0.1, port);
+}

@@ -132,6 +132,10 @@ TickEvent* add_walltime_event(std::chrono::milliseconds delay_msecs,
   struct timeval* delay_ptr = nullptr;
   if (delay_msecs.count() != 0) {
     delay_ptr = &val;
+    // A delay counts from the time libevent cached at the start of this loop
+    // pass, not from now. LPC that ran long in this pass (call_out_walltime,
+    // trace_start) would otherwise get its delay shortened by that much.
+    event_base_update_cache_time(g_event_base);
   }
   /* A failed schedule is not a benign no-op: the TickEvent is never
    * dispatched and never freed, so whatever it carried -- a promise drain, a

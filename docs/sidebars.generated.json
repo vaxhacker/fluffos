@@ -3341,6 +3341,12 @@
           },
           {
             "type": "doc",
+            "id": "apply/master/signal_shutdown",
+            "key": "apply/master/signal_shutdown",
+            "label": "signal_shutdown"
+          },
+          {
+            "type": "doc",
             "id": "apply/master/valid_bind",
             "key": "apply/master/valid_bind",
             "label": "valid_bind"

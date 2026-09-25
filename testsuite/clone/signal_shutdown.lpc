@@ -1,0 +1,34 @@
+// The master tools/test_signal_shutdown.py starts the driver with. The flag
+// picks what signal_shutdown() does; the script sends SIGTERM once READY is
+// printed (the handlers are installed just before the backend loop starts).
+inherit "/single/master";
+
+string mode;
+
+void ready() { debug_message("SIGNAL READY\n"); }
+
+void flag(string arg) {
+  if (sscanf(arg, "signal:%s", mode) != 1) {
+    shutdown(2);
+    return;
+  }
+  call_out_walltime((: ready :), 0.1);
+}
+
+void finish(int sig) {
+  debug_message(sprintf("SIGNAL FINISHED %d\n", sig));
+  shutdown(7);
+}
+
+// graceful: later LPC still runs and the driver exits through shutdown().
+// error: the apply fails, so the driver takes the crash path.
+// wait: nothing finishes; only a second signal ends the driver.
+void signal_shutdown(int sig) {
+  debug_message(sprintf("SIGNAL APPLY %d this_player=%O\n", sig, this_player()));
+  if (mode == "error") error("signal_shutdown refused\n");
+  if (mode == "graceful") call_out_walltime((: finish, sig :), 0.5);
+}
+
+void crash(string msg, object who, object ob) {
+  debug_message(sprintf("SIGNAL CRASH %s\n", msg));
+}

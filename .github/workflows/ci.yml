@@ -175,6 +175,10 @@ jobs:
         if: matrix.platform == 'Ubuntu'
         run: python3 tools/test_http.py build/src/driver
 
+      - name: Signal shutdown
+        if: matrix.platform == 'Ubuntu'
+        run: python3 tools/test_signal_shutdown.py build/src/driver
+
       # Only on Clang Debug (with and without the sanitizer) -- it's the
       # only test that drives real websocket client traffic against the
       # native driver (see src/www/AGENTS.md); the sanitizer variant also

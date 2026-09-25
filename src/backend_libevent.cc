@@ -17,6 +17,7 @@
 #include <chrono>
 #include <set>
 
+#include "mainlib.h"
 #include "vm/vm.h"
 
 // FIXME: rewrite other part so this could become static.
@@ -78,6 +79,7 @@ void on_game_tick(evutil_socket_t /*fd*/, short /*what*/, void* arg) {
   auto t = gametick_timeval();
   event_add(ev, &t);
 
+  dispatch_shutdown_signal();
   backend_run_one_gametick();
 
   // libevent works out how long to wait for the next timer from its cached

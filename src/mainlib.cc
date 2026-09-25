@@ -2,6 +2,7 @@
 
 #include "mainlib.h"
 
+#include <atomic>   // for std::atomic
 #include <clocale>  // for setlocale, LC_ALL
 #ifdef HAVE_SIGNAL_H
 #include <csignal>  //  for signal, SIG_DFL, SIGABRT, etc
@@ -153,7 +154,7 @@ void sig_usr2(int /*sig*/) {
  * Actually, doing all this stuff from a signal is probably illegal
  * -Beek
  */
-void attempt_shutdown(int sig) {
+[[noreturn]] void attempt_shutdown(int sig) {
   const char* msg = "Unkonwn signal!";
   switch (sig) {
     case SIGTERM:
@@ -173,6 +174,18 @@ void attempt_shutdown(int sig) {
 
   // Attempt to call crash()
   fatal(msg);
+}
+
+/* SIGTERM or SIGINT, recorded by its handler for the game tick to hand to the
+ * master (dispatch_shutdown_signal). A second one while the first is pending
+ * or being handled takes the immediate crash path. */
+std::atomic<int> shutdown_signal{0};
+
+void request_shutdown(int sig) {
+  int expected = 0;
+  if (!shutdown_signal.compare_exchange_strong(expected, sig)) {
+    attempt_shutdown(sig);
+  }
 }
 
 void init_locale() {
@@ -260,9 +273,25 @@ struct event_base* init_main(std::string_view config_file) {
   return base;
 }
 
+void dispatch_shutdown_signal() {
+  static bool dispatched = false;
+  int const sig = shutdown_signal.load();
+  if (!sig || dispatched) {
+    return;
+  }
+  dispatched = true;
+  debug_message("Received signal %d, calling master::signal_shutdown().\n", sig);
+  push_number(sig);
+  set_eval(max_eval_cost);
+  auto* ret = safe_apply_master_ob(APPLY_SIGNAL_SHUTDOWN, 1);
+  if (ret == nullptr || ret == (svalue_t*)-1) {
+    attempt_shutdown(sig);
+  }
+}
+
 void setup_signal_handlers() {
-  signal(SIGTERM, attempt_shutdown);
-  signal(SIGINT, attempt_shutdown);
+  signal(SIGTERM, request_shutdown);
+  signal(SIGINT, request_shutdown);
 
 #ifndef _WIN32
   // User signal
